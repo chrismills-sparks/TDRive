@@ -142,6 +142,19 @@ Note: Rive samples images as **premultiplied alpha**. The CPU path
 premultiplies for you; in CUDA mode, premultiply upstream (e.g. a
 Composite/Reorder TOP) if your input has transparency.
 
+### Forcing the CPU path: `TDRIVE_CUDA=0`
+
+The execute mode is a **process-wide, load-time** decision — it applies to
+every Rive TOP in the project. TouchDesigner brackets each cook of a
+CUDA-mode node in `beginCUDAOperations()` / `endCUDAOperations()`, and the
+plugin adds a D3D11 flush plus a CUDA map/unmap round trip per frame, even
+for nodes that inject no textures at all. On one test artboard that measured
+**1.2 ms** per cook on the CPU path versus **4.1 ms** in CUDA mode.
+
+If your project injects no textures, or you hit a driver-level interop
+problem, set **`TDRIVE_CUDA=0`** in the environment before launching
+TouchDesigner and the plugin uses the CPU readback path everywhere.
+
 ## How it works
 
 - Cooks every frame.

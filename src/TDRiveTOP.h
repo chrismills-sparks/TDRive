@@ -41,6 +41,10 @@ public:
 
 private:
     bool loadFileIfNeeded(const char* absPath);
+    // Parses 'absPath' into a menu-only rive::File (cached) and returns it, or
+    // nullptr if it can't be read. See mMenuFile for why this is separate from
+    // the file execute() renders.
+    const rive::File* menuFileFor(const char* absPath);
     bool selectArtboardIfNeeded(const char* name);
     bool selectSceneIfNeeded(const char* stateMachineName);
     void applyInputsFromCHOP(const TD::OP_CHOPInput* chop);
@@ -69,6 +73,36 @@ private:
     std::string mLoadedPath;
     std::string mLoadedArtboard;
     std::string mLoadedStateMachine;
+
+    // Menu-only copy of the .riv, parsed with a CPU-only factory.
+    //
+    // buildDynamicMenu() is called on TouchDesigner's main thread whenever the
+    // Artboard / State Machine menus are opened, which is a different thread
+    // from the one execute() cooks on. It must not reach into mFile/mArtboard/
+    // mScene (the cook thread owns those, and re-importing through them used
+    // to tear down the animation that was already playing), and it must not
+    // depend on the GPU backend having come up - the menus have to work even
+    // when the render context failed to initialize. So the menu keeps its own
+    // parse, cached by path.
+    std::unique_ptr<rive::Factory> mMenuFactory;
+    rive::rcp<rive::File>          mMenuFile;
+    std::string                    mMenuPath;
+
+    // Last File / Artboard parameter values execute() read, captured *before*
+    // it opens the CUDA bracket. In CUDA execute mode TouchDesigner refuses
+    // OP_Inputs / OP_Parameters access once beginCUDAOperations() has run for
+    // the node ("OP_Inputs and OP_Parameters can not be used after
+    // beginCUDAOperations() has been called"), and buildDynamicMenu() is
+    // handed an OP_Inputs it therefore cannot read - so the menus read these
+    // instead. See buildDynamicMenu().
+    std::string mLastParFilePath;
+    std::string mLastParArtboard;
+
+    // Set once execute() has opened the CUDA bracket for this node, which is
+    // the moment the OP_Inputs handed to buildDynamicMenu() stops being
+    // readable. Before that - a node that has not cooked yet - reading the
+    // parameters directly still works and is fresher than the cache.
+    bool mCudaBracketUsed = false;
 
     // Playback timing
     std::chrono::steady_clock::time_point mLastTick;

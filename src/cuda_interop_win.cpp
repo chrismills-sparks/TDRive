@@ -123,6 +123,16 @@ bool AvailableForD3D11()
     return Load() && FindCUDAAdapterOrdinal() >= 0;
 }
 
+bool DisabledByEnv()
+{
+    char buf[16] = {};
+    DWORD n = GetEnvironmentVariableA("TDRIVE_CUDA", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return false;   // unset -> keep the default
+    return _stricmp(buf, "0")     == 0 ||
+           _stricmp(buf, "false") == 0 ||
+           _stricmp(buf, "off")   == 0;
+}
+
 } // namespace tdrive::cuda
 
 #endif // _WIN32

@@ -70,6 +70,11 @@ endif()
 # -----------------------------------------------------------------------------
 set(TDRIVE_SOURCES
     src/TDRiveTOP.cpp
+    # rive::NoOpFactory - the CPU-only rive::Factory the Artboard / State
+    # Machine menus parse through. It lives under utils/ in rive-runtime,
+    # which the 'rive' static lib doesn't compile (its premake only globs
+    # src/**.cpp), so we build this single file into the plugin.
+    "${RIVE_DIR}/utils/no_op_factory.cpp"
 )
 
 if(APPLE)

@@ -25,6 +25,10 @@
 #include "rive/viewmodel/runtime/viewmodel_instance_trigger_runtime.hpp"
 #include "rive/data_bind/data_values/data_type.hpp"
 #include "rive/renderer/rive_renderer.hpp"
+// CPU-only rive::Factory, used to parse the .riv for the Artboard / State
+// Machine menus without involving the GPU backend. Lives in rive-runtime's
+// utils/ rather than src/, so CMake compiles that one file into the plugin.
+#include "utils/no_op_factory.hpp"
 
 #if defined(_WIN32)
 #include "cuda_interop_win.h"
@@ -295,6 +299,8 @@ void TDRiveTOP::pulsePressed(const char* name, void*)
         mScene.reset();
         mArtboard.reset();
         mFile.reset();
+        mMenuFile.reset();
+        mMenuPath.clear();
         mPrevChopValues.clear();
         mPrevDatValues.clear();
     }
@@ -309,40 +315,84 @@ void TDRiveTOP::getErrorString(OP_String* err, void*)
 // Dynamic menus
 // =============================================================================
 
+// Parses the .riv purely to read names out of it. Uses rive::NoOpFactory
+// rather than the backend's render context, so this never touches the GPU and
+// never needs the backend to be initialized - listing artboards is a parsing
+// job, not a rendering one. Cached by path; the Reload pulse clears it.
+const rive::File* TDRiveTOP::menuFileFor(const char* absPath)
+{
+    std::string path = absPath ? absPath : "";
+    if (path.empty()) {
+        mMenuFile.reset();
+        mMenuPath.clear();
+        return nullptr;
+    }
+    if (mMenuFile && path == mMenuPath) return mMenuFile.get();
+
+    mMenuFile.reset();
+    mMenuPath.clear();
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return nullptr;
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                std::istreambuf_iterator<char>());
+
+    if (!mMenuFactory) mMenuFactory = std::make_unique<rive::NoOpFactory>();
+
+    rive::ImportResult ir;
+    auto file = rive::File::import(
+        rive::Span<const uint8_t>(bytes.data(), bytes.size()),
+        mMenuFactory.get(), &ir);
+    if (!file || ir != rive::ImportResult::success) return nullptr;
+
+    mMenuFile = std::move(file);
+    mMenuPath = path;
+    return mMenuFile.get();
+}
+
 void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
                                  OP_BuildDynamicMenuInfo* info, void*)
 {
-    if (!mBackendReady) {
-        std::string err;
-        if (mBackend && mBackend->init(err)) {
-            mBackendReady = true;
-        } else {
-            if (!err.empty()) setError(err);
-            return;
-        }
+    // Once execute() has called beginCUDAOperations() for this node,
+    // TouchDesigner errors on any OP_Inputs / OP_Parameters access ("OP_Inputs
+    // and OP_Parameters can not be used after beginCUDAOperations() has been
+    // called") and the read comes back empty - which is what left the Artboard
+    // and State Machine menus red and empty in issue #5. execute() caches both
+    // values before it opens the bracket, so read those once it has.
+    //
+    // Until then (CPUMem mode, or a node that has not cooked yet) the
+    // parameters are readable and fresher than the cache, so prefer them.
+    std::string path, artboardSel;
+    if (mCudaBracketUsed) {
+        path        = mLastParFilePath;
+        artboardSel = mLastParArtboard;
+    } else {
+        const char* p = inputs->getParFilePath("File");
+        const char* a = inputs->getParString("Artboard");
+        path        = p ? p : "";
+        artboardSel = a ? a : "";
     }
 
-    const char* path = inputs->getParFilePath("File");
-    if (!loadFileIfNeeded(path)) return;
+    const rive::File* file = menuFileFor(path.c_str());
+    if (!file) return;
 
     std::string name = info->name ? info->name : "";
 
     if (name == "Artboard") {
-        for (size_t i = 0; i < mFile->artboardCount(); ++i) {
-            std::string ab = mFile->artboardNameAt(i);
+        for (size_t i = 0; i < file->artboardCount(); ++i) {
+            std::string ab = file->artboardNameAt(i);
             info->addMenuEntry(ab.c_str(), ab.c_str());
         }
         return;
     }
 
     if (name == "Statemachine") {
-        const char* abName = inputs->getParString("Artboard");
-        rive::Artboard* ab = nullptr;
-        if (abName && *abName) ab = mFile->artboard(std::string(abName));
-        if (!ab) ab = mFile->artboard();
+        const rive::Artboard* ab = nullptr;
+        if (!artboardSel.empty()) ab = file->artboard(artboardSel);
+        if (!ab) ab = file->artboard();
         if (!ab) return;
         for (size_t i = 0; i < ab->stateMachineCount(); ++i) {
-            rive::StateMachine* sm = ab->stateMachine(i);
+            const rive::StateMachine* sm = ab->stateMachine(i);
             if (!sm) continue;
             std::string smn = sm->name();
             info->addMenuEntry(smn.c_str(), smn.c_str());
@@ -779,6 +829,11 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     double bg[4] = {0,0,0,0};
     inputs->getParDouble4("Bgcolor", bg[0], bg[1], bg[2], bg[3]);
 
+    // Stash these for buildDynamicMenu(), which in CUDA mode cannot read
+    // parameters itself. Must happen before beginCUDAOperations() below.
+    mLastParFilePath = filePath ? filePath : "";
+    mLastParArtboard = artboard ? artboard : "";
+
     bool ok = loadFileIfNeeded(filePath);
     if (ok) ok = selectArtboardIfNeeded(artboard);
     if (ok) ok = selectSceneIfNeeded(stateMch);
@@ -890,6 +945,12 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         const OP_CUDAArrayInfo* out = output->createCUDAArray(co, nullptr);
         if (!out) { setError("createCUDAArray failed."); return; }
 
+        // From here on TouchDesigner will refuse OP_Inputs / OP_Parameters
+        // access on this node for good, so buildDynamicMenu() has to fall back
+        // to the values cached above. Latch that before the call, not after -
+        // a failed begin still poisons the node.
+        mCudaBracketUsed = true;
+
         if (!mContext->beginCUDAOperations(nullptr)) {
             setError("beginCUDAOperations failed.");
             return;
@@ -957,10 +1018,12 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     // Prefer CUDA execute mode when the machine can do zero-copy texture
     // sharing (Windows + an NVIDIA GPU whose adapter D3D11 can also use).
     // Everything else - macOS, AMD/Intel GPUs, missing CUDA runtime - falls
-    // back to the CPUMem readback path.
+    // back to the CPUMem readback path. TDRIVE_CUDA=0 forces the fallback:
+    // the bracket CUDA mode adds around every cook costs real time even for
+    // nodes that inject no textures (see cuda_interop_win.h).
     info->executeMode = TD::TOP_ExecuteMode::CPUMem;
 #if defined(_WIN32)
-    if (tdrive::cuda::AvailableForD3D11()) {
+    if (!tdrive::cuda::DisabledByEnv() && tdrive::cuda::AvailableForD3D11()) {
         info->executeMode = TD::TOP_ExecuteMode::CUDA;
         gCUDAMode = true;
     }

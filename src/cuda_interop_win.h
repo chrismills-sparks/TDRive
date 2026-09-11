@@ -41,6 +41,18 @@ bool Load();
 // this is what decides TOP_ExecuteMode.
 bool AvailableForD3D11();
 
+// True when TDRIVE_CUDA is set to "0" / "false" / "off", which forces the
+// CPUMem path even on a machine that could do zero-copy interop.
+//
+// CUDA execute mode stays the default wherever it is available. It is not
+// free, though: TouchDesigner brackets every cook of every Rive TOP in
+// TOP_Context::beginCUDAOperations()/endCUDAOperations(), and we add a D3D11
+// flush plus a CUDA map/unmap round trip per frame, whether or not a texture
+// is actually being injected. This is the escape hatch for a project that
+// injects no textures and would rather have the lower cook time, or for
+// anyone who hits a driver-level interop problem.
+bool DisabledByEnv();
+
 // Picks the DXGI adapter (by EnumAdapters ordinal) that maps to a CUDA
 // device. Returns -1 if none.
 int FindCUDAAdapterOrdinal();
