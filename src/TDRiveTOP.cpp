@@ -509,11 +509,29 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
                  ? std::string("No default artboard in file.")
                  : std::string("Artboard not found: ") + name);
         mArtboard.reset(); mScene.reset(); mSMI = nullptr;
+        mLoadedStateMachine.clear();
         return false;
     }
+
+    // Tear down everything derived from the OUTGOING artboard before it is
+    // destroyed, and in this order.
+    //
+    // mScene is a StateMachineInstance built from the current ArtboardInstance
+    // and holds raw pointers into its components, so it must be destroyed while
+    // that artboard is still alive - resetting it after the assignment below
+    // would run ~StateMachineInstance against freed memory.
+    //
+    // mLoadedStateMachine must be cleared too: selectSceneIfNeeded() short
+    // circuits on "mScene && sm == mLoadedStateMachine", so leaving the name set
+    // makes the next cook reuse a Scene belonging to an artboard that no longer
+    // exists. execute() then calls advanceAndApply() on it, which walks dead
+    // components and aborts in _purecall - the crash on switching artboards.
+    mScene.reset();
+    mSMI = nullptr;
+    mLoadedStateMachine.clear();
+
     mArtboard = std::move(ab);
     mLoadedArtboard = name;
-    mSMI = nullptr;
     mPrevChopValues.clear();
     mPrevDatValues.clear();
     bindArtboardViewModel();
