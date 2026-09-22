@@ -107,6 +107,19 @@ rive::Alignment AlignmentFromIndex(int idx)
     }
 }
 
+// Joins the valid values for a property into the Info DAT's "options" cell.
+// Comma separated, because Rive enum values and artboard names routinely
+// contain spaces - a space separator would be ambiguous to split on.
+std::string join_options(const std::vector<std::string>& v)
+{
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += ',';
+        out += v[i];
+    }
+    return out;
+}
+
 bool dat_value_truthy(const std::string& s)
 {
     if (s.empty()) return false;
@@ -359,7 +372,7 @@ bool TDRiveTOP::getInfoDATSize(OP_InfoDATSize* size, void*)
     auto* smi = currentSMI();
     int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
     int32_t vmRows  = mVMRuntime ? (int32_t)mVMRuntime->propertyCount() : 0;
-    size->cols = 4;
+    size->cols = 5;
     size->rows = 1 + smiRows + vmRows;
     size->byColumn = false;
     return true;
@@ -373,6 +386,7 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
         entries->values[1]->setString("name");
         entries->values[2]->setString("type");
         entries->values[3]->setString("value");
+        entries->values[4]->setString("options");
         return;
     }
 
@@ -406,6 +420,7 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
                 entries->values[3]->setString("");
                 break;
         }
+        entries->values[4]->setString("");   // SMI inputs have no option list
         return;
     }
 
@@ -440,10 +455,47 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
         case rive::DataType::trigger:
             entries->values[3]->setString("(pulse)");
             break;
+        case rive::DataType::enumType: {
+            auto* ep = mVMRuntime->propertyEnum(p.name);
+            entries->values[3]->setString(ep ? ep->value().c_str() : "");
+            break;
+        }
+        case rive::DataType::artboard: {
+            auto* ap = mVMRuntime->propertyArtboard(p.name);
+            entries->values[3]->setString(ap ? ap->artboardName().c_str() : "");
+            break;
+        }
         default:
             entries->values[3]->setString("");
             break;
     }
+
+    // "options": the values this property will accept, so the Strings DAT can
+    // be filled in without guessing. Only the types with a closed set have one.
+    std::string options;
+    switch (p.type) {
+        case rive::DataType::enumType:
+            if (auto* ep = mVMRuntime->propertyEnum(p.name))
+                options = join_options(ep->values());
+            break;
+        case rive::DataType::artboard: {
+            // An artboard property accepts any artboard in the file.
+            std::vector<std::string> names;
+            if (mFile) {
+                names.reserve(mFile->artboardCount());
+                for (size_t i = 0; i < mFile->artboardCount(); ++i)
+                    names.push_back(mFile->artboardNameAt(i));
+            }
+            options = join_options(names);
+            break;
+        }
+        case rive::DataType::boolean:
+            options = "0,1";
+            break;
+        default:
+            break;
+    }
+    entries->values[4]->setString(options.c_str());
 }
 
 // =============================================================================
@@ -691,6 +743,12 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 auto pit = mPrevDatValues.find(name);
                 bool changed = (pit == mPrevDatValues.end()) || (pit->second != value);
                 if (changed && dat_value_truthy(value)) tp->trigger();
+                handled = true;
+            } else if (auto* ep = mVMRuntime->propertyEnum(name)) {
+                // Rive ignores a value that isn't one of the enum's cases, so a
+                // typo just leaves the property where it was. The Info DAT's
+                // "options" column lists the accepted values.
+                if (ep->value() != value) ep->value(value);
                 handled = true;
             }
         }
