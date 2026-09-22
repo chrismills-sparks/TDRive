@@ -750,6 +750,22 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 // "options" column lists the accepted values.
                 if (ep->value() != value) ep->value(value);
                 handled = true;
+            } else if (auto* ap = mVMRuntime->propertyArtboard(name)) {
+                // An artboard property takes the NAME of an artboard in this
+                // file. An empty cell means "leave it alone" rather than
+                // "unbind" - these are usually authored with a default, and
+                // silently clearing one on a blank row would be a nasty
+                // surprise.
+                //
+                // artboardName() reads back through the bound asset, so this
+                // compare is what stops us building a fresh ArtboardInstance
+                // every single cook.
+                if (!value.empty() && mFile && ap->artboardName() != value) {
+                    if (auto bindable = mFile->bindableArtboardNamed(value)) {
+                        ap->value(std::move(bindable));
+                    }
+                }
+                handled = true;
             }
         }
 
