@@ -371,7 +371,7 @@ bool TDRiveTOP::getInfoDATSize(OP_InfoDATSize* size, void*)
 {
     auto* smi = currentSMI();
     int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
-    int32_t vmRows  = mVMRuntime ? (int32_t)mVMRuntime->propertyCount() : 0;
+    int32_t vmRows  = (int32_t)mVmProps.size();   // flattened, includes children
     size->cols = 5;
     size->rows = 1 + smiRows + vmRows;
     size->byColumn = false;
@@ -426,29 +426,32 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
 
     if (!mVMRuntime) return;
     int32_t vk = k - smiRows;
-    auto props = mVMRuntime->properties();
-    if (vk < 0 || (size_t)vk >= props.size()) return;
-    const auto& p = props[(size_t)vk];
+    if (vk < 0 || (size_t)vk >= mVmProps.size()) return;
+    // Full path, so a nested property reads as "payoffCard/title" - that string
+    // is exactly what the Strings DAT wants in its name column, and it is what
+    // Rive's own path-taking accessors below expect.
+    const std::string&   path = mVmProps[(size_t)vk].path;
+    const rive::DataType type = mVmProps[(size_t)vk].type;
 
     std::snprintf(buf, sizeof(buf), "%d", vk);
     entries->values[0]->setString(buf);
-    entries->values[1]->setString(p.name.c_str());
-    entries->values[2]->setString(DataTypeName(p.type));
+    entries->values[1]->setString(path.c_str());
+    entries->values[2]->setString(DataTypeName(type));
 
-    switch (p.type) {
+    switch (type) {
         case rive::DataType::string: {
-            auto* sp = mVMRuntime->propertyString(p.name);
+            auto* sp = mVMRuntime->propertyString(path);
             entries->values[3]->setString(sp ? sp->value().c_str() : "");
             break;
         }
         case rive::DataType::number: {
-            auto* np = mVMRuntime->propertyNumber(p.name);
+            auto* np = mVMRuntime->propertyNumber(path);
             if (np) { std::snprintf(buf, sizeof(buf), "%g", np->value()); entries->values[3]->setString(buf); }
             else    { entries->values[3]->setString(""); }
             break;
         }
         case rive::DataType::boolean: {
-            auto* bp = mVMRuntime->propertyBoolean(p.name);
+            auto* bp = mVMRuntime->propertyBoolean(path);
             entries->values[3]->setString(bp ? (bp->value() ? "1" : "0") : "");
             break;
         }
@@ -456,12 +459,12 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
             entries->values[3]->setString("(pulse)");
             break;
         case rive::DataType::enumType: {
-            auto* ep = mVMRuntime->propertyEnum(p.name);
+            auto* ep = mVMRuntime->propertyEnum(path);
             entries->values[3]->setString(ep ? ep->value().c_str() : "");
             break;
         }
         case rive::DataType::artboard: {
-            auto* ap = mVMRuntime->propertyArtboard(p.name);
+            auto* ap = mVMRuntime->propertyArtboard(path);
             entries->values[3]->setString(ap ? ap->artboardName().c_str() : "");
             break;
         }
@@ -473,9 +476,9 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
     // "options": the values this property will accept, so the Strings DAT can
     // be filled in without guessing. Only the types with a closed set have one.
     std::string options;
-    switch (p.type) {
+    switch (type) {
         case rive::DataType::enumType:
-            if (auto* ep = mVMRuntime->propertyEnum(p.name))
+            if (auto* ep = mVMRuntime->propertyEnum(path))
                 options = join_options(ep->values());
             break;
         case rive::DataType::artboard: {
@@ -644,6 +647,7 @@ bool TDRiveTOP::selectSceneIfNeeded(const char* smC)
 void TDRiveTOP::bindArtboardViewModel()
 {
     mVMRuntime.reset();
+    mVmProps.clear();
     // A new VM runtime knows nothing about previously bound images.
     for (auto& p : mBoundSlotImage) p = nullptr;
     if (!mFile || !mArtboard) return;
@@ -654,6 +658,43 @@ void TDRiveTOP::bindArtboardViewModel()
     if (!runtime) return;
     mArtboard->bindViewModelInstance(runtime->instance());
     mVMRuntime = std::move(runtime);
+    rebuildVmProps();
+}
+
+// Walks the view model and every child view model, recording one entry per
+// property keyed by its full '/'-delimited path.
+//
+// The child runtimes returned by propertyViewModel() are cached inside the
+// parent runtime, so recursing here does not create anything that outlives
+// mVMRuntime.
+void TDRiveTOP::collectVmProps(rive::ViewModelInstanceRuntime* vm,
+                               const std::string& prefix, int depth)
+{
+    // A view model may legally contain a property of its own type, so this
+    // walk has to be bounded on both axes or a self-referencing file would
+    // recurse (or fan out) forever.
+    constexpr int    kMaxDepth = 8;
+    constexpr size_t kMaxProps = 2000;
+
+    if (!vm || depth > kMaxDepth || mVmProps.size() >= kMaxProps) return;
+
+    for (const auto& p : vm->properties()) {
+        if (mVmProps.size() >= kMaxProps) return;
+        std::string path = prefix.empty() ? p.name : prefix + "/" + p.name;
+        mVmProps.push_back({path, p.type});
+
+        if (p.type == rive::DataType::viewModel) {
+            if (auto child = vm->propertyViewModel(p.name)) {
+                collectVmProps(child.get(), path, depth + 1);
+            }
+        }
+    }
+}
+
+void TDRiveTOP::rebuildVmProps()
+{
+    mVmProps.clear();
+    if (mVMRuntime) collectVmProps(mVMRuntime.get(), std::string(), 0);
 }
 
 // =============================================================================

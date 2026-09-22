@@ -46,6 +46,21 @@ private:
     void applyInputsFromCHOP(const TD::OP_CHOPInput* chop);
     void applyStringsFromDAT(const TD::OP_DATInput* dat);
     void bindArtboardViewModel();
+
+    // Flattened view-model property tree, rebuilt whenever the view model is
+    // (re)bound. A view model can hold child view models, so the Info DAT
+    // reports one row per property at every depth, addressed by the same
+    // '/'-delimited path Rive's own runtime accessors take - e.g.
+    // "payoffCard/title". That path is what the Strings DAT writes to.
+    struct VmProp {
+        std::string    path;
+        rive::DataType type;
+    };
+    std::vector<VmProp> mVmProps;
+    void rebuildVmProps();
+    void collectVmProps(rive::ViewModelInstanceRuntime* vm,
+                        const std::string& prefix, int depth);
+
     // Texture injection (Image1..N params -> view-model image properties).
     // CPU download path; used on macOS and as the Windows non-CUDA fallback.
     void applyImageInputsCPU(const TD::OP_Inputs* inputs);
