@@ -1335,7 +1335,7 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     // project authored against upstream still opens here, while one authored
     // here warns if opened against an older plugin - the direction we want.
     custom.majorVersion = 0;
-    custom.minorVersion = 5;
+    custom.minorVersion = 6;
 
     custom.minInputs = 0;
     custom.maxInputs = 0;
