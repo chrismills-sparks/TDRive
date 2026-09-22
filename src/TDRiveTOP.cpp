@@ -16,6 +16,7 @@
 #include "rive/scene.hpp"
 #include "rive/layout.hpp"
 #include "rive/math/aabb.hpp"
+#include "rive/math/mat2d.hpp"
 #include "rive/animation/linear_animation_instance.hpp"
 #include "rive/animation/state_machine_input_instance.hpp"
 #include "rive/text/text_value_run.hpp"
@@ -318,18 +319,37 @@ void TDRiveTOP::getErrorString(OP_String* err, void*)
 void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
                                  OP_BuildDynamicMenuInfo* info, void*)
 {
-    if (!mBackendReady) {
-        std::string err;
-        if (mBackend && mBackend->init(err)) {
-            mBackendReady = true;
-        } else {
-            if (!err.empty()) setError(err);
-            return;
-        }
-    }
+    // In CUDA execute mode TouchDesigner refuses OP_Inputs/OP_Parameters for a
+    // node once beginCUDAOperations() has run for it:
+    //
+    //   Error: OP_Inputs and OP_Parameters can not be used after
+    //          beginCUDAOperations() has been called.
+    //
+    // This callback fires outside execute(), so reading a parameter here is
+    // what left both menus empty in CUDA mode - the plugin's bug, not
+    // TouchDesigner's. Nothing here actually needs a parameter: the loaded file
+    // and the selected artboard are already cached from the last cook, so in
+    // CUDA mode we serve the menus from that cache and never touch 'inputs'.
+    //
+    // The cost is that a node which has not cooked yet has no file to list.
+    // getGeneralInfo() sets cookEveryFrame, so that resolves itself on the next
+    // frame rather than needing the menu to be reopened.
+    const bool useInputs = !gCUDAMode;
 
-    const char* path = inputs->getParFilePath("File");
-    if (!loadFileIfNeeded(path)) return;
+    if (useInputs) {
+        if (!mBackendReady) {
+            std::string err;
+            if (mBackend && mBackend->init(err)) {
+                mBackendReady = true;
+            } else {
+                if (!err.empty()) setError(err);
+                return;
+            }
+        }
+        const char* path = inputs->getParFilePath("File");
+        if (!loadFileIfNeeded(path)) return;
+    }
+    if (!mFile) return;
 
     std::string name = info->name ? info->name : "";
 
@@ -342,9 +362,13 @@ void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
     }
 
     if (name == "Statemachine") {
-        const char* abName = inputs->getParString("Artboard");
+        // mLoadedArtboard is what the last cook actually selected, which is the
+        // same value the Artboard parameter holds by the time the menu opens.
+        const char* abPar  = useInputs ? inputs->getParString("Artboard") : nullptr;
+        const std::string abName = (abPar && *abPar) ? std::string(abPar)
+                                                     : mLoadedArtboard;
         rive::Artboard* ab = nullptr;
-        if (abName && *abName) ab = mFile->artboard(std::string(abName));
+        if (!abName.empty()) ab = mFile->artboard(abName);
         if (!ab) ab = mFile->artboard();
         if (!ab) return;
         for (size_t i = 0; i < ab->stateMachineCount(); ++i) {
@@ -1115,6 +1139,16 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         if (!mArtboard) return;
         const rive::Fit fit = FitFromIndex(fitIdx);
         r->save();
+        if (gCUDAMode) {
+            // The CPU path tells TouchDesigner firstPixel = TopLeft, which is
+            // what makes our top-down D3D11 rows come out the right way up.
+            // TOP_CUDAOutputInfo has no equivalent field, so in CUDA mode TD
+            // reads the array bottom-up and the frame arrives upside down.
+            // Flip the scene about the middle of the render target instead -
+            // it is free, where flipping the texture afterwards is another
+            // full-surface copy.
+            r->transform(rive::Mat2D(1.0f, 0.0f, 0.0f, -1.0f, 0.0f, (float)resH));
+        }
         r->align(fit,
                  AlignmentFromIndex(alignIdx),
                  rive::AABB(0, 0, (float)resW, (float)resH),
