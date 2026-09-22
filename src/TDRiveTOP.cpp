@@ -384,13 +384,21 @@ void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
 // Info CHOP - readback cost breakdown
 // =============================================================================
 
-// Where a cook's time actually went, in milliseconds, for the last frame.
+// Where a cook's time actually went, in milliseconds, for the last frame, plus
+// which execute mode produced it.
+//
 // The CPU round-trip (render -> staging -> map -> memcpy -> hand to TD) is the
-// dominant cost at high resolutions, and these channels say which part of it
-// so the attribution doesn't have to be guessed.
+// dominant cost at high resolutions, and these channels say which part of it so
+// the attribution doesn't have to be guessed. cuda_mode is 1 when the plugin
+// registered TOP_ExecuteMode::CUDA (TDRIVE_CUDA=1 and a usable NVIDIA adapter)
+// and 0 for the default CPUMem path - worth having on the node itself, because
+// the env var is set before TouchDesigner launches and there is otherwise no
+// way to tell from inside which mode you ended up in. In CUDA mode the frame
+// never touches the CPU, so the four timing channels all read 0.
 namespace {
 constexpr const char* kInfoChanNames[] = {
     "render_ms", "copy_ms", "map_ms", "memcpy_ms", "readback_total_ms",
+    "cuda_mode",
 };
 constexpr int32_t kNumInfoChans =
     (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
@@ -408,7 +416,11 @@ void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
         mBackend ? mBackend->lastTimings() : tdrive::ReadbackTimings{};
     const double values[] = {
         t.renderMs, t.copyMs, t.mapMs, t.memcpyMs, t.totalMs,
+        gCUDAMode ? 1.0 : 0.0,
     };
+    // These two lists are indexed by the same 'index'; keep them in step.
+    static_assert((int32_t)(sizeof(values) / sizeof(values[0])) == kNumInfoChans,
+                  "kInfoChanNames and values must have the same length");
     chan->name->setString(kInfoChanNames[index]);
     chan->value = (float)values[index];
 }
