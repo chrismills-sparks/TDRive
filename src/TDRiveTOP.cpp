@@ -1105,6 +1105,17 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     custom.opIcon->setString("RIV");
     custom.authorName->setString("Evan Clark");
     custom.authorEmail->setString("you@example.com");
+
+    // Sparks fork version. Deliberately bumping the MINOR version only:
+    // TouchDesigner requires a project's saved major version to MATCH the
+    // installed plugin's, so raising major would make every .toe that already
+    // contains an upstream Rive node (major 0) refuse to load against this
+    // build. Minor only has to be >= what the project was saved with, so a
+    // project authored against upstream still opens here, while one authored
+    // here warns if opened against an older plugin - the direction we want.
+    custom.majorVersion = 0;
+    custom.minorVersion = 4;
+
     custom.minInputs = 0;
     custom.maxInputs = 0;
 }
