@@ -587,6 +587,22 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
 
     mArtboard = std::move(ab);
     mLoadedArtboard = name;
+
+    // Snapshot the artboard's authored frame NOW, before anything advances it.
+    //
+    // This has to be our own snapshot. Rive's own Artboard::originalWidth() is
+    // populated from the width/height properties in Artboard::deserialize(),
+    // and for every .riv tested here it stays 0 - the artboard carries its size
+    // some other way, so that case never fires. width()/height() ARE correct at
+    // this point, but only until the first advance: the layout pass writes its
+    // own result back over them.
+    //
+    // A zero original size also makes Rive's resetSize() actively harmful -
+    // it assigns width(0), height(0) - which is why execute() restores this
+    // snapshot instead of calling it.
+    mArtboardW = mArtboard->width();
+    mArtboardH = mArtboard->height();
+
     mPrevChopValues.clear();
     mPrevDatValues.clear();
     bindArtboardViewModel();
@@ -877,6 +893,51 @@ void TDRiveTOP::applyImageInputsCPU(const OP_Inputs* inputs)
 }
 
 // =============================================================================
+// The align() content box
+// =============================================================================
+
+// The content AABB handed to Renderer::align().
+//
+// Rive's own Artboard::bounds() reports the *layout* box - layoutWidth() /
+// layoutHeight(), i.e. whatever Yoga computed - not the artboard frame the
+// designer drew in. Two things corrupt that box here:
+//
+//   * execute() used to call resetSize() every cook to undo the layout pass,
+//     but resetSize() resets to originalWidth()/originalHeight(), which are 0
+//     for these files (see selectArtboardIfNeeded). So it was pinning the
+//     artboard to 0x0 rather than restoring it.
+//   * even without that, the layout pass inside advanceAndApply() writes its
+//     result back over width()/height(), so they cannot be read after a cook.
+//
+// Aligning against a collapsed box makes every Fit except None degenerate:
+// contain/cover/fill divide the frame width by ~0, so the artboard is scaled
+// into oblivion and the TOP comes out empty. That is the "Fit and Alignment
+// don't work" symptom - only Fit None + Alignment Top Left survives, because
+// that is the one combination that reduces to the identity transform and never
+// touches the content's width or height.
+//
+// So: align against the artboard's authored frame, which is what the Fit and
+// Alignment menus are meant to describe. Fit::layout is the exception - that
+// mode exists precisely to hand the box to Rive's layout engine (and execute()
+// resizes the artboard to the render target for it), so there we use bounds().
+rive::AABB TDRiveTOP::artboardFrame(bool layoutFit) const
+{
+    const rive::AABB b = mArtboard->bounds();
+    if (layoutFit) return b;
+
+    const float w = mArtboardW;
+    const float h = mArtboardH;
+    if (w <= 0.0f || h <= 0.0f) return b;
+
+    // Preserve the artboard's origin offset (bounds() is offset by
+    // -layoutWidth * originX when the artboard doesn't use a frame origin) by
+    // carrying the ratio over to the authored size.
+    const float ox = (b.width()  > 0.0f) ? -b.left() / b.width()  : 0.0f;
+    const float oy = (b.height() > 0.0f) ? -b.top()  / b.height() : 0.0f;
+    return rive::AABB::fromLTWH(-w * ox, -h * oy, w, h);
+}
+
+// =============================================================================
 // Execute
 // =============================================================================
 
@@ -945,13 +1006,20 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 
     // In layout mode resize the artboard to the render target so Rive's internal
     // layout constraints (fill, etc.) apply to the actual output dimensions.
-    // In all other modes restore the artboard's intrinsic size from the .riv file.
+    // In all other modes restore the artboard's authored size.
+    //
+    // Restoring it is not optional: the layout pass inside advanceAndApply()
+    // overwrites width()/height() with what Yoga computed, so without this the
+    // artboard shrinks a little more every cook. We restore our own snapshot
+    // rather than calling Rive's resetSize(), which resets to originalWidth() /
+    // originalHeight() - zero for these files (see selectArtboardIfNeeded).
     if (ok && mArtboard) {
         if (FitFromIndex(fitIdx) == rive::Fit::layout) {
             mArtboard->width((float)resW);
             mArtboard->height((float)resH);
-        } else {
-            mArtboard->resetSize();
+        } else if (mArtboardW > 0.0f && mArtboardH > 0.0f) {
+            mArtboard->width(mArtboardW);
+            mArtboard->height(mArtboardH);
         }
     }
 
@@ -972,11 +1040,12 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 
     auto drawFn = [this, fitIdx, alignIdx, resW, resH](rive::Renderer* r) {
         if (!mArtboard) return;
+        const rive::Fit fit = FitFromIndex(fitIdx);
         r->save();
-        r->align(FitFromIndex(fitIdx),
+        r->align(fit,
                  AlignmentFromIndex(alignIdx),
                  rive::AABB(0, 0, (float)resW, (float)resH),
-                 mArtboard->bounds());
+                 artboardFrame(fit == rive::Fit::layout));
         mArtboard->draw(r);
         r->restore();
     };

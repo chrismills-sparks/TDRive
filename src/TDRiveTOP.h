@@ -47,6 +47,9 @@ private:
     void applyStringsFromDAT(const TD::OP_DATInput* dat);
     void bindArtboardViewModel();
 
+    // The content box handed to Renderer::align().
+    rive::AABB artboardFrame(bool layoutFit) const;
+
     // Flattened view-model property tree, rebuilt whenever the view model is
     // (re)bound. A view model can hold child view models, so the Info DAT
     // reports one row per property at every depth, addressed by the same
@@ -80,6 +83,12 @@ private:
     std::unique_ptr<rive::Scene>                mScene;
     rive::StateMachineInstance*                 mSMI = nullptr;  // non-owning
     rive::rcp<rive::ViewModelInstanceRuntime>   mVMRuntime;
+
+    // The artboard's authored frame, snapshotted when the instance is created.
+    // See selectArtboardIfNeeded() for why Rive's own originalWidth() and
+    // resetSize() cannot be used for this.
+    float mArtboardW = 0.0f;
+    float mArtboardH = 0.0f;
 
     std::string mLoadedPath;
     std::string mLoadedArtboard;
