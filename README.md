@@ -52,6 +52,36 @@ cmake --build build --config Release
 :: -> build\Release\TDRiveTOP.dll
 ```
 
+### The CPython schema endpoint
+
+On Windows the plugin exposes its property schema to Python (see
+[Generating controls automatically](#generating-controls-automatically-rivecontroltox)),
+which needs Python 3.11 headers and `python3.lib` at build time. CMake finds
+them automatically from your newest TouchDesigner install, so a normal dev
+build needs no extra flags. Two roots are accepted if you need to point it
+elsewhere with `-DTD_PYTHON_ROOT=<path>`:
+
+| Layout | Headers | Import library |
+|---|---|---|
+| TouchDesigner's bundled SDK | `Include/Python.h` (+ `Include/PC/`) | `lib/x64/python3.lib` |
+| A stock CPython 3.11 install | `include/Python.h` | `libs/python3.lib` |
+
+The second is what `actions/setup-python` produces, which is how CI builds it
+— GitHub runners have no TouchDesigner to borrow the SDK from.
+
+**If CMake cannot resolve a root, configuring fails.** That is deliberate. The
+endpoint is compiled behind `#if defined(TDRIVE_PYTHON)`, so a build without
+it produces a plugin that loads and renders perfectly but has no Python
+attributes at all — indistinguishable from a broken install until someone
+touches `propertySchema`. If you want that build, ask for it explicitly with
+`-DTDRIVE_PYTHON=OFF`. To check any DLL you have been handed:
+
+```sh
+python scripts/verify_python_endpoint.py build/Release/TDRiveTOP.dll
+```
+
+macOS has no Python wiring yet; the plugin builds without the endpoint there.
+
 ## Install in TouchDesigner
 
 Drop the build output into TouchDesigner's plugin search path:
@@ -141,6 +171,15 @@ Three read-only attributes on the node:
 for e in op('rive1').propertySchema:
     print(e['path'], e['type'], e['value'])
 ```
+
+> **If those attributes raise `AttributeError`,** the node is fine — your DLL
+> was built without the schema endpoint, so TouchDesigner never built a Python
+> class for it. Confirm with
+> `python scripts/verify_python_endpoint.py <your>.dll` and see
+> [The CPython schema endpoint](#the-cpython-schema-endpoint). The prebuilt
+> Windows DLL in **v1.7.0-sparks** — the release that introduced these
+> attributes — is affected: CI built it without the endpoint. Rebuild from
+> source, or use a later release.
 
 The trick that makes `tdJSONPars` work without a lookup table: each entry
 carries the **Rive property path in its `label`**, not its name. A path
