@@ -104,20 +104,64 @@ artboard — text on screen reads from view-model `string` / `number` /
 auto-binds the artboard's default view model when one exists.
 
 The **Strings DAT** parameter points at a Table DAT with two columns. Each
-row is `name` followed by `value`. An optional `name value` header row is
-skipped if the first cell of row 0 is exactly `name` / `Name` / `key` /
-`Key`. For each row:
+row is `name` followed by `value`. An optional header row is skipped if the
+first cell of row 0 is exactly `name` / `Name` / `key` / `Key` /
+`label` / `Label`. For each row:
 
 - If a view-model property with that name exists, the value is coerced to
   the property's type (`string`, `number`, `bool`) and written. Triggers
   fire on a rising edge — when the cell content changes AND parses to a
   truthy value (`1`, `true`, `fire`, `on`, `yes`, or a positive number).
+- Otherwise, if the selected state machine declares an input with that
+  name, the value is applied to it. The **Inputs CHOP** stays the better
+  path for *animated* numerics — no float→string→float round trip per
+  frame — but this lets one DAT drive an entire artboard.
 - Otherwise, the TOP falls back to `artboard->getTextRun(name, "")` so
   older files (named text runs, no view model) keep working.
 
 The Info DAT lists `vm:string` / `vm:number` / `vm:bool` / `vm:trigger`
 rows for each view-model property, alongside the SMI inputs. Use it as the
 reference when populating your Strings DAT.
+
+## Generating controls automatically (RiveControl.tox)
+
+Filling a Strings DAT by hand gets old fast — `sanabrandv008.riv` exposes
+46 properties. The TOP therefore publishes its schema to Python, and
+`RiveControl.tox` in this repo turns that into parameters with one pulse.
+
+Three read-only attributes on the node:
+
+| Attribute | Returns |
+|---|---|
+| `schemaVersion` | Format version of the two below, so a consumer can detect drift. |
+| `propertySchema` | Every addressable property: `index`, `source` (`smi`/`vm`), `path`, `type`, `value`, `options`, `container`. |
+| `tdJSONPars` | The drivable subset, as TDJSON parameter dicts ready for `TDJSON.addParametersFromJSONList`. |
+
+```python
+for e in op('rive1').propertySchema:
+    print(e['path'], e['type'], e['value'])
+```
+
+The trick that makes `tdJSONPars` work without a lookup table: each entry
+carries the **Rive property path in its `label`**, not its name. A path
+like `payoffCard/barGraph1Label` is not a legal TouchDesigner parameter
+name, but it is a perfectly legal label — so a Parameter DAT set to emit
+labels (`name=False, label=True, header=False`) produces exactly the
+two-column table the Strings DAT parameter already consumes.
+
+**Using the component:** drop `RiveControl.tox` into your project, set its
+**Rive TOP** parameter, and pulse **Build**. It generates one parameter per
+addressable property (grouped onto a page per nested view model) and points
+that TOP's Strings DAT at its own output. Build is get-or-create, so
+re-running it after changing artboard or file adds and updates parameters
+without disturbing values you have already set. **Clear** removes the
+generated parameters — separate from Build precisely because it discards
+their values, expressions and exports.
+
+Properties with no write path (`vm:viewModel` containers, `vm:list`,
+`vm:color`, `vm:image`, `vm:font`) are deliberately skipped rather than
+generated as parameters that would do nothing; the Status parameter reports
+how many.
 
 ## Injecting textures (view-model image properties)
 
