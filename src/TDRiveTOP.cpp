@@ -5,6 +5,7 @@
 #include "TDRiveTOP.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -251,16 +252,8 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
         np.maxSliders[0] = 4.0;
         m->appendFloat(np);
     }
-    {
-        OP_NumericParameter np("Resolution");
-        np.label = "Resolution";
-        np.page  = "Rive";
-        np.defaultValues[0] = (double)kDefaultWidth;
-        np.defaultValues[1] = (double)kDefaultHeight;
-        np.minSliders[0] = 16;  np.maxSliders[0] = 4096;
-        np.minSliders[1] = 16;  np.maxSliders[1] = 4096;
-        m->appendWH(np);
-    }
+    // NOTE: no custom Resolution parameter. The output size comes from the
+    // node's built-in Common page, like any other TOP - see computeResolution().
     // Texture injection: each slot pairs a source TOP with the name of the
     // view-model image property it drives (see the Info DAT for the "vm:image"
     // properties the loaded .riv exposes).
@@ -893,30 +886,27 @@ void TDRiveTOP::applyImageInputsCPU(const OP_Inputs* inputs)
 }
 
 // =============================================================================
-// The align() content box
+// Output size and the align() content box
 // =============================================================================
 
 // The content AABB handed to Renderer::align().
 //
 // Rive's own Artboard::bounds() reports the *layout* box - layoutWidth() /
 // layoutHeight(), i.e. whatever Yoga computed - not the artboard frame the
-// designer drew in. Two things corrupt that box here:
+// designer drew in. For every .riv tested here Yoga collapses that box on the
+// horizontal axis (measured ~0-6 px wide against artboards more than a
+// thousand pixels tall), because the artboard carries a layout style whose
+// children are ordinary shapes rather than layout components, so "hug the
+// content" hugs nothing.
 //
-//   * execute() used to call resetSize() every cook to undo the layout pass,
-//     but resetSize() resets to originalWidth()/originalHeight(), which are 0
-//     for these files (see selectArtboardIfNeeded). So it was pinning the
-//     artboard to 0x0 rather than restoring it.
-//   * even without that, the layout pass inside advanceAndApply() writes its
-//     result back over width()/height(), so they cannot be read after a cook.
-//
-// Aligning against a collapsed box makes every Fit except None degenerate:
+// Aligning against a zero-width box makes every Fit except None degenerate:
 // contain/cover/fill divide the frame width by ~0, so the artboard is scaled
 // into oblivion and the TOP comes out empty. That is the "Fit and Alignment
 // don't work" symptom - only Fit None + Alignment Top Left survives, because
-// that is the one combination that reduces to the identity transform and never
+// that combination is the one that reduces to the identity transform and never
 // touches the content's width or height.
 //
-// So: align against the artboard's authored frame, which is what the Fit and
+// So: align against the artboard's own frame, which is what the Fit and
 // Alignment menus are meant to describe. Fit::layout is the exception - that
 // mode exists precisely to hand the box to Rive's layout engine (and execute()
 // resizes the artboard to the render target for it), so there we use bounds().
@@ -937,6 +927,89 @@ rive::AABB TDRiveTOP::artboardFrame(bool layoutFit) const
     return rive::AABB::fromLTWH(-w * ox, -h * oy, w, h);
 }
 
+// Output resolution, from the node's built-in Common page - the same Output
+// Resolution / Resolution parameters every other TOP has, rather than a custom
+// one duplicating them.
+//
+// Reading built-in parameters from a custom operator is quietly inconsistent,
+// so the two calls used here are the ones verified to work on this SDK:
+//
+//   getParString("outputresolution")     resolves
+//   getParInt2("resolution", &w, &h)     resolves (the tuplet's BASE name)
+//   getParInt("resolutionw") / ("...h")  does NOT - OP_Inputs raises
+//                                        "Cannot find parameter named"
+//
+// The menu arithmetic is done here rather than through TouchDesigner's own
+// TOP_Output::getSuggestedOutputDesc(), for two reasons. It is API v12 (TD 2025
+// series) and td_sdk/ vendors v11, so adopting it would stop this plugin
+// loading in TD 2023. And it would not help anyway: this TOP declares no TOP
+// inputs, so every input-relative mode comes back measured against a phantom
+// 127x127 input - asking for Half of a 460x140 artboard returned 63x63.
+//
+// With no input to inherit from, "Use Input" means the artboard's own size.
+// That is the right default for a .riv - a fresh node comes up at the size the
+// file was designed at, and Fit / Alignment then have nothing to do - and it is
+// also the base the scale and Fit/Limit options measure.
+//
+// Not supported: Use Global Res Multiplier (the C++ API exposes no way to read
+// the global multiplier) and Parent Panel Size (a plugin has no handle on the
+// panel hosting it); both fall back to the artboard size. Parent Panel Size
+// could be supported by moving td_sdk/ to the 2025 SDK and calling
+// getSuggestedOutputDesc() for that one mode.
+void TDRiveTOP::computeResolution(const OP_Inputs* inputs,
+                                  int32_t& outW, int32_t& outH) const
+{
+    double baseW = (double)kDefaultWidth;
+    double baseH = (double)kDefaultHeight;
+    if (mArtboard && mArtboardW > 0.0f && mArtboardH > 0.0f) {
+        baseW = (double)mArtboardW;
+        baseH = (double)mArtboardH;
+    }
+
+    const char* modeStr = inputs->getParString("outputresolution");
+    const std::string mode = modeStr ? modeStr : "useinput";
+
+    double parW = 0.0, parH = 0.0;
+    {
+        int32_t pw = 0, ph = 0;
+        if (inputs->getParInt2("resolution", pw, ph)) {
+            parW = (double)pw;
+            parH = (double)ph;
+        }
+    }
+
+    double w = baseW, h = baseH;
+    double mult = 0.0;
+    if      (mode == "eighth")  mult = 1.0 / 8.0;
+    else if (mode == "quarter") mult = 1.0 / 4.0;
+    else if (mode == "half")    mult = 1.0 / 2.0;
+    else if (mode == "2x")      mult = 2.0;
+    else if (mode == "4x")      mult = 4.0;
+    else if (mode == "8x")      mult = 8.0;
+
+    if (mult > 0.0) {
+        w = baseW * mult;
+        h = baseH * mult;
+    } else if (mode == "fit" || mode == "limit") {
+        if (parW > 0.0 && parH > 0.0) {
+            double sc = std::min(parW / baseW, parH / baseH);
+            if (mode == "limit") sc = std::min(sc, 1.0);   // Limit only shrinks
+            w = baseW * sc;
+            h = baseH * sc;
+        }
+    } else if (mode == "custom") {
+        if (parW > 0.0 && parH > 0.0) {
+            w = parW;
+            h = parH;
+        }
+    }
+    // "useinput", "parpanel", and anything unrecognised, keep the artboard
+    // size - see the note above on Parent Panel Size.
+
+    outW = std::clamp((int32_t)std::lround(w), 1, 32768);
+    outH = std::clamp((int32_t)std::lround(h), 1, 32768);
+}
+
 // =============================================================================
 // Execute
 // =============================================================================
@@ -952,18 +1025,6 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mBackendReady = true;
     }
 
-    int32_t resW = 0, resH = 0;
-    inputs->getParInt2("Resolution", resW, resH);
-    if (resW <= 0) resW = kDefaultWidth;
-    if (resH <= 0) resH = kDefaultHeight;
-    {
-        std::string err;
-        if (!mBackend->ensureRenderTarget((uint32_t)resW, (uint32_t)resH, err)) {
-            if (!err.empty()) setError(err);
-            return;
-        }
-    }
-
     const char* filePath = inputs->getParFilePath("File");
     const char* artboard = inputs->getParString("Artboard");
     const char* stateMch = inputs->getParString("Statemachine");
@@ -976,6 +1037,18 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     bool ok = loadFileIfNeeded(filePath);
     if (ok) ok = selectArtboardIfNeeded(artboard);
     if (ok) ok = selectSceneIfNeeded(stateMch);
+
+    // The output size can depend on the artboard (Use Input and the scale
+    // options are all measured from it), so the file has to be resolved first.
+    int32_t resW = 0, resH = 0;
+    computeResolution(inputs, resW, resH);
+    {
+        std::string err;
+        if (!mBackend->ensureRenderTarget((uint32_t)resW, (uint32_t)resH, err)) {
+            if (!err.empty()) setError(err);
+            return;
+        }
+    }
 
     if (ok && currentSMI()) {
         if (const auto* chop = inputs->getParCHOP("Inputs")) {

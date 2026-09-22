@@ -47,7 +47,11 @@ private:
     void applyStringsFromDAT(const TD::OP_DATInput* dat);
     void bindArtboardViewModel();
 
-    // The content box handed to Renderer::align().
+    // Output size from the node's built-in Common page (no custom Resolution
+    // parameter), and the content box handed to Renderer::align(). Both need
+    // the artboard, so both run after the file/artboard are resolved.
+    void computeResolution(const TD::OP_Inputs* inputs,
+                           int32_t& outW, int32_t& outH) const;
     rive::AABB artboardFrame(bool layoutFit) const;
 
     // Flattened view-model property tree, rebuilt whenever the view model is
