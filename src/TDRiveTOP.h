@@ -35,6 +35,8 @@ public:
     void pulsePressed(const char* name, void*) override;
     void getErrorString(TD::OP_String* error, void*) override;
     void buildDynamicMenu(const TD::OP_Inputs*, TD::OP_BuildDynamicMenuInfo*, void*) override;
+    int32_t getNumInfoCHOPChans(void*) override;
+    void getInfoCHOPChan(int32_t index, TD::OP_InfoCHOPChan* chan, void*) override;
     bool getInfoDATSize(TD::OP_InfoDATSize*, void*) override;
     void getInfoDATEntries(int32_t index, int32_t nEntries,
                            TD::OP_InfoDATEntries* entries, void*) override;

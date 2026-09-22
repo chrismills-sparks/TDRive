@@ -381,6 +381,39 @@ void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
 }
 
 // =============================================================================
+// Info CHOP - readback cost breakdown
+// =============================================================================
+
+// Where a cook's time actually went, in milliseconds, for the last frame.
+// The CPU round-trip (render -> staging -> map -> memcpy -> hand to TD) is the
+// dominant cost at high resolutions, and these channels say which part of it
+// so the attribution doesn't have to be guessed.
+namespace {
+constexpr const char* kInfoChanNames[] = {
+    "render_ms", "copy_ms", "map_ms", "memcpy_ms", "readback_total_ms",
+};
+constexpr int32_t kNumInfoChans =
+    (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
+} // namespace
+
+int32_t TDRiveTOP::getNumInfoCHOPChans(void*)
+{
+    return kNumInfoChans;
+}
+
+void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
+{
+    if (!chan || index < 0 || index >= kNumInfoChans) return;
+    const tdrive::ReadbackTimings t =
+        mBackend ? mBackend->lastTimings() : tdrive::ReadbackTimings{};
+    const double values[] = {
+        t.renderMs, t.copyMs, t.mapMs, t.memcpyMs, t.totalMs,
+    };
+    chan->name->setString(kInfoChanNames[index]);
+    chan->value = (float)values[index];
+}
+
+// =============================================================================
 // Info DAT
 // =============================================================================
 
