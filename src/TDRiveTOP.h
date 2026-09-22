@@ -41,6 +41,31 @@ public:
     void getInfoDATEntries(int32_t index, int32_t nEntries,
                            TD::OP_InfoDATEntries* entries, void*) override;
 
+    // One addressable input on the loaded artboard.
+    //
+    // Rive's input surface comes in two generations and this flattens both
+    // into one list: state-machine inputs first (the original API - flat,
+    // number/bool/trigger only), then the view-model tree (data binding -
+    // nested, many types, addressed by '/'-delimited path).
+    //
+    // This is the single source of truth behind BOTH the Info DAT and the
+    // node's Python `propertySchema`. They must not format values
+    // independently: the two halves used to be walked separately, which is
+    // how the Info DAT's index column ended up restarting at 0 partway down
+    // the table.
+    struct SchemaEntry {
+        std::string source;    // "smi" | "vm"
+        std::string path;      // "Hover", or "payoffCard/barGraph1Label"
+        std::string type;      // "number"/"bool"/"trigger", or "vm:string"/...
+        std::string value;     // current value, stringified
+        std::vector<std::string> options;  // closed-set values; else empty
+        bool container = false;            // vm:viewModel - branch, not a leaf
+    };
+
+    // Walks the live state, so it is not const and not cheap - call it once
+    // per cook, not per row.
+    std::vector<SchemaEntry> propertySchema();
+
 private:
     bool loadFileIfNeeded(const char* absPath);
     bool selectArtboardIfNeeded(const char* name);
@@ -66,6 +91,9 @@ private:
         rive::DataType type;
     };
     std::vector<VmProp> mVmProps;
+    // Rebuilt in getInfoDATSize() and walked by getInfoDATEntries(). TD asks
+    // for the size before it walks the rows, so one rebuild covers the table.
+    std::vector<SchemaEntry> mSchemaCache;
     void rebuildVmProps();
     void collectVmProps(rive::ViewModelInstanceRuntime* vm,
                         const std::string& prefix, int depth);

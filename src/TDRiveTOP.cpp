@@ -5,6 +5,7 @@
 #include "TDRiveTOP.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -32,6 +33,15 @@
 #include "cuda_interop_win.h"
 #endif
 
+#if defined(TDRIVE_PYTHON)
+// Python.h comes AFTER the TD SDK headers on purpose. CPlusPlus_Common.hpp
+// forward-declares PyObject / PyGetSetDef / PyMethodDef behind
+// `#ifndef PyObject_HEAD`; re-typedef'ing the same type is legal in C++, so
+// either order compiles. This matches Derivative's own CHOPWithPythonClass
+// sample, which includes the SDK header first and Python.h in the .cpp.
+#include <Python.h>
+#endif
+
 using namespace TD;
 
 // =============================================================================
@@ -42,6 +52,21 @@ namespace {
 
 constexpr uint32_t kDefaultWidth  = 1280;
 constexpr uint32_t kDefaultHeight = 720;
+
+#if defined(TDRIVE_PYTHON)
+// customOPInfo.pythonVersion is TD's load-time gate on plugins that hand back
+// CPython objects. The SDK says to pass PY_VERSION from the headers you built
+// against, and Derivative's own sample does exactly that - but that pins the
+// DLL to a single CPython PATCH release, and TD's patch level moves: 2023.x
+// ships 3.11.1, 2025.32460 ships 3.11.10, 2025.33230 ships 3.11.15.
+//
+// We build against the PEP 384 stable ABI (Py_LIMITED_API + python3.lib), so
+// the binary genuinely runs on any of them, and we report the 3.11 floor
+// instead of the patch we happened to compile on. The real ABI gate is the
+// import library, not this string: on a host without a matching python3.dll
+// the import simply fails to resolve and the DLL never loads at all.
+constexpr const char* kTDRivePythonVersion = "3.11.1";
+#endif
 
 // SMI input type keys from rive/generated/animation/state_machine_*_base.hpp.
 constexpr uint16_t kInputTypeNumber  = 56;
@@ -429,13 +454,122 @@ void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
 // Info DAT
 // =============================================================================
 
+// Flattens both generations of Rive input into one list: state-machine
+// inputs first, then the view-model tree. Everything that reports the
+// artboard's input surface - the Info DAT, the node's Python schema - goes
+// through here, so a value only has to be formatted once.
+std::vector<TDRiveTOP::SchemaEntry> TDRiveTOP::propertySchema()
+{
+    std::vector<SchemaEntry> out;
+    char buf[64];
+
+    // ---- State-machine inputs (the original API: flat, three types) -------
+    if (auto* smi = currentSMI()) {
+        out.reserve(smi->inputCount() + mVmProps.size());
+        for (size_t i = 0; i < smi->inputCount(); ++i) {
+            auto* in = smi->input(i);
+            if (!in) continue;
+
+            SchemaEntry e;
+            e.source = "smi";
+            e.path   = in->name();
+            e.type   = InputTypeName(in->inputCoreType());
+
+            switch (in->inputCoreType()) {
+                case kInputTypeNumber:
+                    std::snprintf(buf, sizeof(buf), "%g",
+                                  static_cast<rive::SMINumber*>(in)->value());
+                    e.value = buf;
+                    break;
+                case kInputTypeBool:
+                    e.value   = static_cast<rive::SMIBool*>(in)->value() ? "1" : "0";
+                    e.options = {"0", "1"};
+                    break;
+                case kInputTypeTrigger:
+                    e.value = "(pulse)";
+                    break;
+                default:
+                    break;
+            }
+            out.push_back(std::move(e));
+        }
+    } else {
+        out.reserve(mVmProps.size());
+    }
+
+    // ---- View-model tree (data binding: nested, many types) ---------------
+    if (!mVMRuntime) return out;
+
+    for (const auto& p : mVmProps) {
+        // Full path, so a nested property reads as "payoffCard/title" - that
+        // string is exactly what the Strings DAT wants in its name column, and
+        // what Rive's own path-taking accessors below expect.
+        const std::string&   path = p.path;
+        const rive::DataType type = p.type;
+
+        SchemaEntry e;
+        e.source    = "vm";
+        e.path      = path;
+        e.type      = DataTypeName(type);
+        e.container = (type == rive::DataType::viewModel);
+
+        switch (type) {
+            case rive::DataType::string: {
+                auto* sp = mVMRuntime->propertyString(path);
+                if (sp) e.value = sp->value();
+                break;
+            }
+            case rive::DataType::number: {
+                if (auto* np = mVMRuntime->propertyNumber(path)) {
+                    std::snprintf(buf, sizeof(buf), "%g", np->value());
+                    e.value = buf;
+                }
+                break;
+            }
+            case rive::DataType::boolean: {
+                auto* bp = mVMRuntime->propertyBoolean(path);
+                if (bp) e.value = bp->value() ? "1" : "0";
+                e.options = {"0", "1"};
+                break;
+            }
+            case rive::DataType::trigger:
+                e.value = "(pulse)";
+                break;
+            case rive::DataType::enumType: {
+                if (auto* ep = mVMRuntime->propertyEnum(path)) {
+                    e.value   = ep->value();
+                    e.options = ep->values();
+                }
+                break;
+            }
+            case rive::DataType::artboard: {
+                if (auto* ap = mVMRuntime->propertyArtboard(path))
+                    e.value = ap->artboardName();
+                // An artboard property accepts any artboard in the file.
+                if (mFile) {
+                    e.options.reserve(mFile->artboardCount());
+                    for (size_t i = 0; i < mFile->artboardCount(); ++i)
+                        e.options.push_back(mFile->artboardNameAt(i));
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        out.push_back(std::move(e));
+    }
+
+    return out;
+}
+
 bool TDRiveTOP::getInfoDATSize(OP_InfoDATSize* size, void*)
 {
-    auto* smi = currentSMI();
-    int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
-    int32_t vmRows  = (int32_t)mVmProps.size();   // flattened, includes children
+    // Built here rather than per row: TD asks for the size before it walks
+    // the rows, so one rebuild covers the whole table.
+    mSchemaCache = propertySchema();
     size->cols = 5;
-    size->rows = 1 + smiRows + vmRows;
+    size->rows = 1 + (int32_t)mSchemaCache.size();
     size->byColumn = false;
     return true;
 }
@@ -452,115 +586,21 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
         return;
     }
 
-    auto* smi = currentSMI();
-    int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
-    int32_t k = row - 1;
-    char buf[64];
+    // Defensive even though getInfoDATSize() runs first: a stale row index
+    // would otherwise read off the end of the cache.
+    const int32_t k = row - 1;
+    if (k < 0 || (size_t)k >= mSchemaCache.size()) return;
+    const SchemaEntry& e = mSchemaCache[(size_t)k];
 
-    if (k < smiRows) {
-        auto* in = smi->input((size_t)k);
-        std::snprintf(buf, sizeof(buf), "%d", k);
-        entries->values[0]->setString(buf);
-        entries->values[1]->setString(in->name().c_str());
-        entries->values[2]->setString(InputTypeName(in->inputCoreType()));
-        switch (in->inputCoreType()) {
-            case kInputTypeNumber: {
-                auto* n = static_cast<rive::SMINumber*>(in);
-                std::snprintf(buf, sizeof(buf), "%g", n->value());
-                entries->values[3]->setString(buf);
-                break;
-            }
-            case kInputTypeBool: {
-                auto* b = static_cast<rive::SMIBool*>(in);
-                entries->values[3]->setString(b->value() ? "1" : "0");
-                break;
-            }
-            case kInputTypeTrigger:
-                entries->values[3]->setString("(pulse)");
-                break;
-            default:
-                entries->values[3]->setString("");
-                break;
-        }
-        entries->values[4]->setString("");   // SMI inputs have no option list
-        return;
-    }
-
-    if (!mVMRuntime) return;
-    int32_t vk = k - smiRows;
-    if (vk < 0 || (size_t)vk >= mVmProps.size()) return;
-    // Full path, so a nested property reads as "payoffCard/title" - that string
-    // is exactly what the Strings DAT wants in its name column, and it is what
-    // Rive's own path-taking accessors below expect.
-    const std::string&   path = mVmProps[(size_t)vk].path;
-    const rive::DataType type = mVmProps[(size_t)vk].type;
-
-    std::snprintf(buf, sizeof(buf), "%d", vk);
+    // One monotonic index across BOTH blocks. It used to restart at 0 at the
+    // state-machine/view-model boundary, so two rows could share an index.
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d", k);
     entries->values[0]->setString(buf);
-    entries->values[1]->setString(path.c_str());
-    entries->values[2]->setString(DataTypeName(type));
-
-    switch (type) {
-        case rive::DataType::string: {
-            auto* sp = mVMRuntime->propertyString(path);
-            entries->values[3]->setString(sp ? sp->value().c_str() : "");
-            break;
-        }
-        case rive::DataType::number: {
-            auto* np = mVMRuntime->propertyNumber(path);
-            if (np) { std::snprintf(buf, sizeof(buf), "%g", np->value()); entries->values[3]->setString(buf); }
-            else    { entries->values[3]->setString(""); }
-            break;
-        }
-        case rive::DataType::boolean: {
-            auto* bp = mVMRuntime->propertyBoolean(path);
-            entries->values[3]->setString(bp ? (bp->value() ? "1" : "0") : "");
-            break;
-        }
-        case rive::DataType::trigger:
-            entries->values[3]->setString("(pulse)");
-            break;
-        case rive::DataType::enumType: {
-            auto* ep = mVMRuntime->propertyEnum(path);
-            entries->values[3]->setString(ep ? ep->value().c_str() : "");
-            break;
-        }
-        case rive::DataType::artboard: {
-            auto* ap = mVMRuntime->propertyArtboard(path);
-            entries->values[3]->setString(ap ? ap->artboardName().c_str() : "");
-            break;
-        }
-        default:
-            entries->values[3]->setString("");
-            break;
-    }
-
-    // "options": the values this property will accept, so the Strings DAT can
-    // be filled in without guessing. Only the types with a closed set have one.
-    std::string options;
-    switch (type) {
-        case rive::DataType::enumType:
-            if (auto* ep = mVMRuntime->propertyEnum(path))
-                options = join_options(ep->values());
-            break;
-        case rive::DataType::artboard: {
-            // An artboard property accepts any artboard in the file.
-            std::vector<std::string> names;
-            if (mFile) {
-                names.reserve(mFile->artboardCount());
-                for (size_t i = 0; i < mFile->artboardCount(); ++i)
-                    names.push_back(mFile->artboardNameAt(i));
-            }
-            options = join_options(names);
-            break;
-        }
-        case rive::DataType::boolean:
-            options = "0,1";
-            break;
-        default:
-            break;
-    }
-    entries->values[4]->setString(options.c_str());
+    entries->values[1]->setString(e.path.c_str());
+    entries->values[2]->setString(e.type.c_str());
+    entries->values[3]->setString(e.value.c_str());
+    entries->values[4]->setString(join_options(e.options).c_str());
 }
 
 // =============================================================================
@@ -831,8 +871,13 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
     int32_t startRow = 0;
     if (dat->numRows > 0) {
         const char* c0 = dat->getCell(0, 0);
-        if (c0 && (!std::strcmp(c0, "name") || !std::strcmp(c0, "Name") ||
-                   !std::strcmp(c0, "key")  || !std::strcmp(c0, "Key"))) {
+        // "label" matters as much as "name" here: a Parameter DAT set to
+        // emit labels (which is how a control COMP hands us Rive paths, since
+        // TD par NAMES cannot contain '/') writes "label" into this cell.
+        // Without it the header row gets applied as a property called "label".
+        if (c0 && (!std::strcmp(c0, "name")  || !std::strcmp(c0, "Name")  ||
+                   !std::strcmp(c0, "key")   || !std::strcmp(c0, "Key")   ||
+                   !std::strcmp(c0, "label") || !std::strcmp(c0, "Label"))) {
             startRow = 1;
         }
     }
@@ -885,6 +930,50 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                     }
                 }
                 handled = true;
+            }
+        }
+
+        // State-machine inputs. These have their own CHOP parameter, which
+        // stays the better path for ANIMATED numerics (no float->string->float
+        // round trip per frame) - but routing them here too means one
+        // Parameter DAT can drive a whole artboard, including older files that
+        // predate data binding.
+        if (!handled) {
+            if (auto* smi = currentSMI()) {
+                for (size_t i = 0; i < smi->inputCount(); ++i) {
+                    auto* in = smi->input(i);
+                    if (!in || in->name() != name) continue;
+                    switch (in->inputCoreType()) {
+                        case kInputTypeNumber: {
+                            auto* n = static_cast<rive::SMINumber*>(in);
+                            try {
+                                float v = std::stof(value);
+                                if (n->value() != v) n->value(v);
+                            } catch (...) {}
+                            break;
+                        }
+                        case kInputTypeBool: {
+                            auto* b = static_cast<rive::SMIBool*>(in);
+                            const bool nb = dat_value_truthy(value);
+                            if (b->value() != nb) b->value(nb);
+                            break;
+                        }
+                        case kInputTypeTrigger: {
+                            // Same edge rule as the CHOP path: fire when the
+                            // cell CHANGES to something truthy, so a constant
+                            // "1" fires once instead of every cook.
+                            auto pit = mPrevDatValues.find(name);
+                            const bool changed = (pit == mPrevDatValues.end()) ||
+                                                 (pit->second != value);
+                            if (changed && dat_value_truthy(value))
+                                static_cast<rive::SMITrigger*>(in)->fire();
+                            break;
+                        }
+                        default: break;
+                    }
+                    handled = true;
+                    break;
+                }
             }
         }
 
@@ -1293,6 +1382,308 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 }
 
 // =============================================================================
+// Python class on the node
+// =============================================================================
+//
+// TD builds a Python class for this operator out of customOPInfo.pythonGetSets,
+// so `op('rive1').<name>` reaches straight into the plugin. That is the only
+// way to hand the loaded .riv's property schema to Python: an OP_Inputs can
+// read a CHOP, a DAT or a TOP, but nothing lets it read a COMP's parameters,
+// and Python cannot read a custom OP's Info DAT without a real Info DAT
+// operator wired up.
+
+#if defined(TDRIVE_PYTHON)
+namespace {
+
+// Bumped whenever the emitted schema's shape changes, so a control COMP built
+// against an older plugin can notice and rebuild rather than silently
+// mis-mapping fields.
+constexpr const char* kTDRiveSchemaVersion = "1.0";
+
+// The PyObject TD hands a getter IS a PY_Struct, and its context can return
+// our C++ instance. A null result is legitimate rather than exceptional - a
+// script can hold the Python object after its node was deleted - and
+// getNodeInstance() has already set the Python error in that case, so callers
+// just propagate the null.
+TDRiveTOP* PyNodeInstance(PyObject* self, bool autoCook)
+{
+    auto* me = reinterpret_cast<PY_Struct*>(self);
+    PY_GetInfo info;
+    info.autoCook = autoCook;
+    return static_cast<TDRiveTOP*>(me->context->getNodeInstance(info));
+}
+
+PyObject* pyGetSchemaVersion(PyObject* self, void*)
+{
+    // A constant, so there is nothing to cook for - but we still resolve the
+    // instance, because that is what proves the node is still alive.
+    if (!PyNodeInstance(self, /*autoCook=*/false)) return nullptr;
+    return PyUnicode_FromString(kTDRiveSchemaVersion);
+}
+
+// PyDict_SetItemString does NOT steal a reference, so each value built here is
+// released whether or not the insert succeeded. Getting this wrong leaks on
+// every cook of every node - and a getter that leaks takes TouchDesigner down
+// with it, not just this operator.
+bool DictSetStr(PyObject* d, const char* key, const std::string& v)
+{
+    PyObject* o = PyUnicode_FromString(v.c_str());
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+bool DictSetLong(PyObject* d, const char* key, long v)
+{
+    PyObject* o = PyLong_FromLong(v);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+bool DictSetBool(PyObject* d, const char* key, bool v)
+{
+    PyObject* o = PyBool_FromLong(v ? 1 : 0);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+// Hands Python a real list rather than the Info DAT's comma-joined cell:
+// Rive enum values and artboard names can contain commas, so splitting the
+// joined form back apart downstream would be lossy.
+bool DictSetStrList(PyObject* d, const char* key,
+                    const std::vector<std::string>& vals)
+{
+    PyObject* list = PyList_New(0);
+    if (!list) return false;
+    for (const auto& s : vals) {
+        PyObject* o = PyUnicode_FromString(s.c_str());
+        if (!o) { Py_DECREF(list); return false; }
+        const bool appended = PyList_Append(list, o) == 0;
+        Py_DECREF(o);
+        if (!appended) { Py_DECREF(list); return false; }
+    }
+    const bool ok = PyDict_SetItemString(d, key, list) == 0;
+    Py_DECREF(list);
+    return ok;
+}
+
+PyObject* pyGetPropertySchema(PyObject* self, void*)
+{
+    // autoCook: the schema describes the loaded file/artboard, and a node that
+    // has never cooked has neither. Cook first so a fresh node reports its real
+    // surface rather than an empty list.
+    TDRiveTOP* inst = PyNodeInstance(self, /*autoCook=*/true);
+    if (!inst) return nullptr;
+
+    const std::vector<TDRiveTOP::SchemaEntry> schema = inst->propertySchema();
+
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+
+    long index = 0;
+    for (const auto& e : schema) {
+        PyObject* d = PyDict_New();
+        if (!d) { Py_DECREF(list); return nullptr; }
+
+        const bool ok =
+            DictSetLong(d, "index", index) &&
+            DictSetStr(d, "source", e.source) &&
+            DictSetStr(d, "path", e.path) &&
+            DictSetStr(d, "type", e.type) &&
+            DictSetStr(d, "value", e.value) &&
+            DictSetStrList(d, "options", e.options) &&
+            DictSetBool(d, "container", e.container);
+
+        if (!ok) { Py_DECREF(d); Py_DECREF(list); return nullptr; }
+
+        const bool appended = PyList_Append(list, d) == 0;
+        Py_DECREF(d);
+        if (!appended) { Py_DECREF(list); return nullptr; }
+        ++index;
+    }
+
+    return list;
+}
+
+bool DictSetDouble(PyObject* d, const char* key, double v)
+{
+    PyObject* o = PyFloat_FromDouble(v);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+// The TD parameter style a schema entry maps to, or nullptr when the entry
+// cannot be driven as a parameter.
+//
+// The list is deliberately narrower than the type list the schema reports: an
+// entry only earns a parameter if applyStringsFromDAT() can actually apply it.
+// vm:viewModel is a branch rather than a value; vm:list, vm:color, vm:image
+// and vm:font have no write path yet, and generating dead parameters for them
+// would look like support that isn't there.
+const char* ParStyleForType(const std::string& type, bool container)
+{
+    if (container) return nullptr;
+    if (type == "vm:string")   return "Str";
+    if (type == "vm:number")   return "Float";
+    if (type == "vm:integer")  return "Int";
+    if (type == "vm:bool")     return "Toggle";
+    if (type == "vm:trigger")  return "Pulse";
+    if (type == "vm:enum")     return "Menu";
+    if (type == "vm:artboard") return "Menu";
+    // State-machine inputs.
+    if (type == "number")      return "Float";
+    if (type == "bool")        return "Toggle";
+    if (type == "trigger")     return "Pulse";
+    return nullptr;
+}
+
+// TD parameter names must start with a capital letter and hold only letters
+// and digits, so a Rive path cannot be one. The LABEL carries the real path
+// instead - labels are unconstrained, which is what lets a Parameter DAT emit
+// the Rive path verbatim and feed it straight back into the Strings DAT. That
+// makes this name a handle and nothing more: being unique and stable matters,
+// being pretty does not.
+std::string ManglePath(const std::string& path)
+{
+    // Capital first character, everything after it lower case. That looks
+    // lossy next to a camelCase path, but it is exactly what TD enforces:
+    // addParametersFromJSONList() takes "CopyCTA" and silently stores
+    // "Copycta". Mangling to anything else would make the collision check
+    // below run on a namespace TD does not actually use, so two paths
+    // differing only in case would pass here and then clobber each other.
+    std::string out;
+    for (char c : path) {
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const bool digit = (c >= '0' && c <= '9');
+        if (!alpha && !digit) continue;   // '/', spaces and '-' just vanish
+        if (out.empty() && digit) out += 'P';   // may not START with a digit
+        out += out.empty() ? (char)std::toupper((unsigned char)c)
+                           : (char)std::tolower((unsigned char)c);
+    }
+    if (out.empty()) out = "P";
+    return out;
+}
+
+PyObject* pyGetTdJSONPars(PyObject* self, void*)
+{
+    TDRiveTOP* inst = PyNodeInstance(self, /*autoCook=*/true);
+    if (!inst) return nullptr;
+
+    const std::vector<TDRiveTOP::SchemaEntry> schema = inst->propertySchema();
+
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+
+    // Mangling is lossy, so two different Rive paths can collide on one name.
+    // Collisions get a numeric suffix; order is stable because the schema walk
+    // is, which keeps names the same across rebuilds of the same file.
+    std::unordered_map<std::string, int> used;
+
+    for (const auto& e : schema) {
+        const char* style = ParStyleForType(e.type, e.container);
+        if (!style) continue;
+
+        std::string name = ManglePath(e.path);
+        const int seen = ++used[name];
+        if (seen > 1) name += std::to_string(seen);
+
+        PyObject* d = PyDict_New();
+        if (!d) { Py_DECREF(list); return nullptr; }
+
+        // Nested view models become their own parameter page: one flat page of
+        // 46 parameters is unusable, and the first path segment is already the
+        // grouping the Rive author chose.
+        const size_t slash = e.path.find('/');
+        const std::string page =
+            (slash == std::string::npos) ? std::string("Rive")
+                                         : e.path.substr(0, slash);
+
+        bool ok =
+            DictSetStr(d, "name", name) &&
+            // The whole point: the label is the Rive path, verbatim.
+            DictSetStr(d, "label", e.path) &&
+            DictSetStr(d, "page", page) &&
+            DictSetStr(d, "style", style) &&
+            DictSetLong(d, "size", 1) &&
+            DictSetBool(d, "enable", true) &&
+            DictSetBool(d, "readOnly", false) &&
+            DictSetBool(d, "startSection", false) &&
+            DictSetStr(d, "help", e.type + "  -  " + e.path) &&
+            // Carried through so a generator can route by origin without
+            // re-deriving it from the style.
+            DictSetStr(d, "riveSource", e.source) &&
+            DictSetStr(d, "rivePath", e.path) &&
+            DictSetStr(d, "riveType", e.type);
+
+        if (ok) {
+            const std::string s = style;
+            if (s == "Float" || s == "Int") {
+                double v = 0.0;
+                try { v = std::stod(e.value); } catch (...) { v = 0.0; }
+                ok = ok && (s == "Int" ? DictSetLong(d, "default", (long)v)
+                                       : DictSetDouble(d, "default", v));
+                // Rive publishes no range for a number property, so nothing
+                // here is authoritative: these are SLIDER HINTS only, and the
+                // clamps stay off so any value can still be typed in. 0..100
+                // covers the common Rive percentage case; anything outside it
+                // gets a range built around the value we actually found.
+                const double hi = (v > 100.0 || v < 0.0)
+                                      ? std::abs(v) * 2.0 : 100.0;
+                ok = ok && DictSetDouble(d, "normMin", 0.0)
+                        && DictSetDouble(d, "normMax", hi)
+                        && DictSetBool(d, "clampMin", false)
+                        && DictSetBool(d, "clampMax", false);
+            } else if (s == "Toggle") {
+                ok = ok && DictSetBool(d, "default", e.value == "1");
+            } else if (s == "Menu") {
+                ok = ok && DictSetStr(d, "default", e.value)
+                        && DictSetStrList(d, "menuNames", e.options)
+                        && DictSetStrList(d, "menuLabels", e.options);
+            } else if (s == "Pulse") {
+                // A pulse holds no value; "(pulse)" is display text from the
+                // Info DAT and must not leak into a default.
+                ok = ok && DictSetLong(d, "default", 0);
+            } else {
+                ok = ok && DictSetStr(d, "default", e.value);
+            }
+        }
+
+        if (!ok) { Py_DECREF(d); Py_DECREF(list); return nullptr; }
+
+        const bool appended = PyList_Append(list, d) == 0;
+        Py_DECREF(d);
+        if (!appended) { Py_DECREF(list); return nullptr; }
+    }
+
+    return list;
+}
+
+PyGetSetDef gPyGetSets[] = {
+    {"schemaVersion", pyGetSchemaVersion, nullptr,
+     "Version of the property-schema format this plugin emits.", nullptr},
+    {"propertySchema", pyGetPropertySchema, nullptr,
+     "List of dicts describing every addressable input on the loaded artboard: "
+     "index, source ('smi'/'vm'), path, type, value, options, container.",
+     nullptr},
+    {"tdJSONPars", pyGetTdJSONPars, nullptr,
+     "Parameter definitions in TDJSON form, one per addressable Rive property. "
+     "Each carries the Rive path in 'label' (TD labels are unconstrained) so a "
+     "Parameter DAT can emit it straight back into the node's Strings DAT.",
+     nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+} // namespace
+#endif // TDRIVE_PYTHON
+
+// =============================================================================
 // Plugin entry points
 // =============================================================================
 
@@ -1335,10 +1726,17 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     // project authored against upstream still opens here, while one authored
     // here warns if opened against an older plugin - the direction we want.
     custom.majorVersion = 0;
-    custom.minorVersion = 6;
+    custom.minorVersion = 7;
 
     custom.minInputs = 0;
     custom.maxInputs = 0;
+
+#if defined(TDRIVE_PYTHON)
+    // Declaring the version is what lets this node hand CPython objects back
+    // to TD; pythonGetSets is what TD builds the node's Python class from.
+    custom.pythonVersion->setString(kTDRivePythonVersion);
+    custom.pythonGetSets = gPyGetSets;
+#endif
 }
 
 TD_VIS DLLEXPORT TD::TOP_CPlusPlusBase*

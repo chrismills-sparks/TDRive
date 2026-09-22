@@ -107,6 +107,62 @@ target_include_directories(TDRiveTOP PRIVATE
 
 target_link_libraries(TDRiveTOP PRIVATE ${RIVE_LIBS})
 
+# -----------------------------------------------------------------------------
+# CPython - the schema endpoint (pythonGetSets) exposed on the node.
+# -----------------------------------------------------------------------------
+# We build against the Python SDK TouchDesigner ships with itself, so there is
+# no external Python dependency. Two things matter here:
+#
+#   * Py_LIMITED_API + python3.lib = the PEP 384 stable ABI. That binds the
+#     plugin to python3.dll rather than python311.dll, so it is not hostage to
+#     a single CPython minor release. Everything the schema getter needs
+#     (PyGetSetDef, PyDict_*, PyUnicode_FromString, PyFloat_FromDouble,
+#     PyBool_FromLong, PyList_*) lives inside the limited API.
+#   * customOPInfo.pythonVersion is a separate, softer gate TD checks at load
+#     time - see kTDRivePythonVersion in TDRiveTOP.cpp.
+#
+# Point TD_PYTHON_ROOT at .../Samples/CPlusPlus/3rdParty/Python to override the
+# auto-discovery below.
+option(TDRIVE_PYTHON "Expose the Rive property schema through CPython" ON)
+
+if(TDRIVE_PYTHON AND WIN32)
+    if(NOT TD_PYTHON_ROOT)
+        file(GLOB _td_py_roots
+             "C:/Program Files/Derivative/TouchDesigner.*/Samples/CPlusPlus/3rdParty/Python")
+        if(_td_py_roots)
+            list(SORT _td_py_roots)
+            list(REVERSE _td_py_roots)          # newest install first
+            list(GET _td_py_roots 0 TD_PYTHON_ROOT)
+        endif()
+    endif()
+
+    if(TD_PYTHON_ROOT AND EXISTS "${TD_PYTHON_ROOT}/Include/Python.h")
+        message(STATUS "TDRive: CPython schema endpoint ON, using ${TD_PYTHON_ROOT}")
+        target_include_directories(TDRiveTOP PRIVATE
+            "${TD_PYTHON_ROOT}/Include"
+            "${TD_PYTHON_ROOT}/Include/PC"
+        )
+        target_link_directories(TDRiveTOP PRIVATE "${TD_PYTHON_ROOT}/lib/x64")
+        # pyconfig.h emits `#pragma comment(lib, "python3.lib")` once
+        # Py_LIMITED_API is defined, so the search path above is all the linker
+        # needs - naming the lib again here would be redundant.
+        target_compile_definitions(TDRiveTOP PRIVATE
+            TDRIVE_PYTHON
+            Py_LIMITED_API=0x030B0000   # 3.11, the floor TD 2023+ ships
+        )
+    else()
+        message(WARNING
+            "TDRIVE_PYTHON is ON but no Python SDK was found.\n"
+            "Looked for <install>/Samples/CPlusPlus/3rdParty/Python/Include/Python.h.\n"
+            "Pass -DTD_PYTHON_ROOT=<path>, or -DTDRIVE_PYTHON=OFF to build without "
+            "the schema endpoint.")
+    endif()
+elseif(TDRIVE_PYTHON)
+    # macOS wiring is not done yet; the plugin still builds, just without the
+    # schema endpoint.
+    message(STATUS "TDRive: CPython schema endpoint is Windows-only for now.")
+endif()
+
 # The Rive static libs are built with RTTI disabled (they use an internal
 # "lite rtti" scheme). Any rive-derived class we instantiate in plugin TUs
 # (e.g. RiveRenderImage) would otherwise emit typeinfo references to symbols
