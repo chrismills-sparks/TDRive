@@ -972,13 +972,13 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
 {
     info->apiVersion  = TD::TOPCPlusPlusAPIVersion;
 
-    // Prefer CUDA execute mode when the machine can do zero-copy texture
-    // sharing (Windows + an NVIDIA GPU whose adapter D3D11 can also use).
-    // Everything else - macOS, AMD/Intel GPUs, missing CUDA runtime - falls
-    // back to the CPUMem readback path.
+    // CPUMem everywhere by default. Upstream picks CUDA execute mode
+    // automatically on Windows + NVIDIA; in this fork that is opt-in behind
+    // TDRIVE_CUDA=1, because as shipped it renders flipped, kills the dynamic
+    // menus and costs ~8x the cook time. See cuda_interop_win.h.
     info->executeMode = TD::TOP_ExecuteMode::CPUMem;
 #if defined(_WIN32)
-    if (tdrive::cuda::AvailableForD3D11()) {
+    if (tdrive::cuda::EnabledByEnv() && tdrive::cuda::AvailableForD3D11()) {
         info->executeMode = TD::TOP_ExecuteMode::CUDA;
         gCUDAMode = true;
     }
