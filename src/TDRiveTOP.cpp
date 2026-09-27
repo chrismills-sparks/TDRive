@@ -1699,10 +1699,9 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
 {
     info->apiVersion  = TD::TOPCPlusPlusAPIVersion;
 
-    // CPUMem everywhere by default. Upstream picks CUDA execute mode
-    // automatically on Windows + NVIDIA; in this fork that is opt-in behind
-    // TDRIVE_CUDA=1, because as shipped it renders flipped, kills the dynamic
-    // menus and costs ~8x the cook time. See cuda_interop_win.h.
+    // CPUMem everywhere by default; CUDA execute mode is opt-in behind
+    // TDRIVE_CUDA=1 because it costs every Rive TOP a CUDA bracket per cook,
+    // injecting or not. See cuda_interop_win.h.
     info->executeMode = TD::TOP_ExecuteMode::CPUMem;
 #if defined(_WIN32)
     if (tdrive::cuda::EnabledByEnv() && tdrive::cuda::AvailableForD3D11()) {
@@ -1716,15 +1715,12 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     custom.opLabel->setString("Rive");
     custom.opIcon->setString("RIV");
     custom.authorName->setString("Evan Clark");
-    custom.authorEmail->setString("you@example.com");
+    custom.authorEmail->setString("djevanclark@gmail.com");
 
-    // Sparks fork version. Deliberately bumping the MINOR version only:
-    // TouchDesigner requires a project's saved major version to MATCH the
-    // installed plugin's, so raising major would make every .toe that already
-    // contains an upstream Rive node (major 0) refuse to load against this
-    // build. Minor only has to be >= what the project was saved with, so a
-    // project authored against upstream still opens here, while one authored
-    // here warns if opened against an older plugin - the direction we want.
+    // Bump the MINOR version only: TouchDesigner requires a project's saved
+    // major version to MATCH the installed plugin's, so raising major would
+    // stop every existing .toe containing a Rive node (major 0) from loading.
+    // Minor only has to be >= what the project was saved with.
     custom.majorVersion = 0;
     custom.minorVersion = 7;
 

@@ -69,8 +69,18 @@ jobs:
           RIVE_PREMAKE_ARGS: "--with_rive_text --with_rive_layout --with_rive_canvas --with_rive_scripting"
         run: ./scripts/build_rive.sh release
 
+      - name: Setup Python 3.11
+        # Headers for the CPython schema endpoint. The runner has no
+        # TouchDesigner to borrow them from; the macOS plugin links no
+        # libpython, so any 3.11 layout works (see CMakeLists.txt).
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Configure plugin
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: |
+          test -n "$pythonLocation" || { echo "pythonLocation is unset"; exit 1; }
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DTD_PYTHON_ROOT="$pythonLocation"
 
       - name: Build plugin
         run: cmake --build build --config Release --parallel
@@ -84,6 +94,11 @@ jobs:
         with:
           path: third_party/rive-runtime/renderer/out
           key: rive-macos-${{ steps.rive.outputs.sha }}-v4
+
+      - name: Verify CPython schema endpoint
+        # Also proves -undefined dynamic_lookup is hiding nothing but _Py*
+        # symbols. Runs before packaging so a bad binary never becomes a zip.
+        run: python3 scripts/verify_python_endpoint.py build/TDRiveTOP.plugin/Contents/MacOS/TDRiveTOP
 
       - name: Package macOS plugin
         # Bake the pinned Rive tag into the zip name so downloaders can see
@@ -189,7 +204,7 @@ jobs:
         # TouchDesigner install; this runner has no TouchDesigner, so we supply
         # a stock CPython instead and point TD_PYTHON_ROOT at it below. Without
         # this the old CMake lookup missed, warned, and shipped a plugin with
-        # the whole endpoint compiled out - see v1.7.0-sparks.
+        # the whole endpoint compiled out.
         #
         # 3.11 deliberately: it matches Py_LIMITED_API=0x030B0000 in
         # CMakeLists.txt, the PEP 384 floor TD 2023+ ships. The stable ABI is
@@ -241,10 +256,6 @@ jobs:
         # CMake is now fatal when it cannot find a Python SDK, but this checks
         # the DLL itself, so no configuration change can quietly undo it.
         # Runs BEFORE packaging so a stripped DLL never becomes a zip.
-        #
-        # Windows only: the macOS plugin has no Python wiring yet (the
-        # elseif(TDRIVE_PYTHON) branch in CMakeLists.txt), so there is nothing
-        # to verify in that job.
         shell: pwsh
         run: python scripts/verify_python_endpoint.py build\Release\TDRiveTOP.dll
 

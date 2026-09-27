@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assert a built TDRiveTOP.dll really carries the CPython schema endpoint.
+"""Assert a built TDRiveTOP plugin really carries the CPython schema endpoint.
 
 Why this exists
 ---------------
@@ -11,7 +11,7 @@ node and every documented attribute raises:
     tdAttributeError: 'td.RiveTOP' object has no attribute 'propertySchema'
 
 Nothing in a normal build or smoke test distinguishes that DLL from a good one.
-v1.7.0-sparks shipped exactly that way: CI has no TouchDesigner install, CMake's
+A release once shipped exactly that way: CI has no TouchDesigner install, CMake's
 SDK lookup missed, the old code warned instead of failing, and the release went
 out with the endpoint silently stripped. CMake is now fatal on a missed lookup;
 this script is the belt to that braces, checking the *artifact* rather than the
@@ -19,25 +19,37 @@ build configuration, so a Python-less DLL can never reach a release again.
 
 What it checks
 --------------
+Windows (PE):
 1. `python3.dll` appears in the PE import table. This is the load-bearing
    signal: the endpoint calls into CPython through the PEP 384 stable ABI, so
    a DLL that does not import python3.dll cannot possibly serve it.
-2. Every `gPyGetSets` name is present in the binary's data, which catches a
-   partially-compiled or renamed endpoint that still links CPython.
+
+macOS (Mach-O): the plugin links no libpython; its Python symbols are left to
+load-time lookup against TouchDesigner's interpreter (-undefined dynamic_lookup).
+1. At least one `_Py*` symbol is dynamically looked up - the endpoint is in.
+2. NOTHING else is dynamically looked up. dynamic_lookup applies to every
+   symbol, so a missing Rive or system symbol would otherwise link cleanly and
+   only fail when TouchDesigner loads the plugin.
+
+Both:
+- Every `gPyGetSets` name is present in the binary's data, which catches a
+  partially-compiled or renamed endpoint that still links CPython.
 
 Usage
 -----
     python scripts/verify_python_endpoint.py build/Release/TDRiveTOP.dll
+    python3 scripts/verify_python_endpoint.py build/TDRiveTOP.plugin/Contents/MacOS/TDRiveTOP
 
-Exits 0 when the DLL carries the endpoint, 1 otherwise. Windows PE only - the
-macOS plugin has no Python wiring yet (see CMakeLists.txt), so there is nothing
-to verify there.
+Exits 0 when the plugin carries the endpoint, 1 otherwise. The Mach-O check
+shells out to `nm` (Xcode command line tools).
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -121,50 +133,113 @@ def imported_dlls(path: Path) -> list[str]:
     return names
 
 
+MACHO_MAGICS = (
+    b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64, little-endian
+    b"\xca\xfe\xba\xbe",  # FAT_MAGIC (universal binary)
+)
+
+_PY_SYMBOL = re.compile(r"^__?Py")
+
+
+def dynamic_lookup_symbols(path: Path) -> list[str]:
+    """Undefined symbols `nm` reports as '(dynamically looked up)'."""
+    out = subprocess.run(
+        ["nm", "-m", "-u", str(path)], capture_output=True, text=True, check=True
+    ).stdout
+    syms = []
+    for line in out.splitlines():
+        if "(dynamically looked up)" in line:
+            m = re.search(r"external (\S+)", line)
+            if m:
+                syms.append(m.group(1))
+    return sorted(set(syms))
+
+
+def check_pe(path: Path) -> list[str]:
+    """Return failure reasons for a Windows DLL (empty list = OK)."""
+    imports = imported_dlls(path)
+    has_python = any(dll.lower() == REQUIRED_IMPORT for dll in imports)
+    print(f"  imports: {', '.join(imports) or '(none)'}")
+    print(f"  {REQUIRED_IMPORT} imported: {'yes' if has_python else 'NO'}")
+    if has_python:
+        return []
+    return [
+        f"No {REQUIRED_IMPORT} import - the plugin was built without "
+        "TDRIVE_PYTHON defined.\n"
+        "  Configure with -DTD_PYTHON_ROOT=<python sdk> (see CMakeLists.txt) "
+        "and rebuild."
+    ]
+
+
+def check_macho(path: Path) -> list[str]:
+    """Return failure reasons for a macOS plugin binary (empty list = OK)."""
+    syms = dynamic_lookup_symbols(path)
+    py = [s for s in syms if _PY_SYMBOL.match(s)]
+    other = [s for s in syms if not _PY_SYMBOL.match(s)]
+    print(f"  load-time Python symbols: {len(py)}")
+    print(f"  load-time non-Python symbols: {len(other)}")
+    problems = []
+    if not py:
+        problems.append(
+            "No Python symbol is looked up at load time - the plugin was built "
+            "without TDRIVE_PYTHON defined.\n"
+            "  Configure with -DTD_PYTHON_ROOT=<python 3.11 root> (see "
+            "CMakeLists.txt) and rebuild."
+        )
+    if other:
+        problems.append(
+            "-undefined dynamic_lookup is hiding non-Python symbols that nothing "
+            "at link time resolved; TouchDesigner would fail to load this plugin:\n"
+            + "\n".join(f"    {s}" for s in other)
+        )
+    return problems
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Verify a TDRiveTOP.dll carries the CPython schema endpoint."
+        description="Verify a TDRiveTOP plugin carries the CPython schema endpoint."
     )
-    ap.add_argument("dll", type=Path, help="path to the built TDRiveTOP.dll")
+    ap.add_argument(
+        "binary",
+        type=Path,
+        help="TDRiveTOP.dll, or the Mach-O inside TDRiveTOP.plugin/Contents/MacOS",
+    )
     args = ap.parse_args()
+    path: Path = args.binary
 
-    if not args.dll.is_file():
-        print(f"FAIL: {args.dll} does not exist", file=sys.stderr)
+    if not path.is_file():
+        print(f"FAIL: {path} does not exist", file=sys.stderr)
         return 1
 
+    blob = path.read_bytes()
+    print(f"{path}  ({len(blob):,} bytes)")
     try:
-        imports = imported_dlls(args.dll)
-    except (PEError, struct.error, ValueError) as exc:
-        print(f"FAIL: could not parse {args.dll}: {exc}", file=sys.stderr)
+        if blob[:2] == b"MZ":
+            problems = check_pe(path)
+        elif blob[:4] in MACHO_MAGICS:
+            problems = check_macho(path)
+        else:
+            print(f"FAIL: {path} is neither a PE nor a Mach-O image", file=sys.stderr)
+            return 1
+    except (PEError, struct.error, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"FAIL: could not inspect {path}: {exc}", file=sys.stderr)
         return 1
 
-    blob = args.dll.read_bytes()
     missing_getsets = [
         name for name in EXPECTED_GETSETS if name.encode("ascii") not in blob
     ]
-    has_python = any(dll.lower() == REQUIRED_IMPORT for dll in imports)
-
-    print(f"{args.dll}  ({args.dll.stat().st_size:,} bytes)")
-    print(f"  imports: {', '.join(imports) or '(none)'}")
-    print(f"  {REQUIRED_IMPORT} imported: {'yes' if has_python else 'NO'}")
     for name in EXPECTED_GETSETS:
         present = name not in missing_getsets
         print(f"  getset {name}: {'present' if present else 'MISSING'}")
 
-    if has_python and not missing_getsets:
+    if not problems and not missing_getsets:
         print("OK: CPython schema endpoint is present.")
         return 0
 
     print("", file=sys.stderr)
-    print("FAIL: this DLL does not carry the CPython schema endpoint.", file=sys.stderr)
-    if not has_python:
-        print(
-            f"  No {REQUIRED_IMPORT} import - the plugin was built without "
-            "TDRIVE_PYTHON defined.\n"
-            "  Configure with -DTD_PYTHON_ROOT=<python sdk> (see CMakeLists.txt) "
-            "and rebuild.",
-            file=sys.stderr,
-        )
+    print("FAIL: this plugin does not carry the CPython schema endpoint.", file=sys.stderr)
+    for p in problems:
+        print(f"  {p}", file=sys.stderr)
     if missing_getsets:
         print(
             f"  Missing getset name(s): {', '.join(missing_getsets)}.\n"

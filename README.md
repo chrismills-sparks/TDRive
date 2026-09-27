@@ -78,9 +78,14 @@ touches `propertySchema`. If you want that build, ask for it explicitly with
 
 ```sh
 python scripts/verify_python_endpoint.py build/Release/TDRiveTOP.dll
+python3 scripts/verify_python_endpoint.py build/TDRiveTOP.plugin/Contents/MacOS/TDRiveTOP
 ```
 
-macOS has no Python wiring yet; the plugin builds without the endpoint there.
+On macOS, CMake finds the headers in
+`/Applications/TouchDesigner*.app/Contents/Frameworks/Python.framework/Versions/3.11`
+(or any CPython 3.11 root passed as `TD_PYTHON_ROOT`). The plugin links no
+libpython: its Python symbols bind at load time to the interpreter
+TouchDesigner already has loaded, so one build runs on every TD 2023+ install.
 
 ## Install in TouchDesigner
 
@@ -106,7 +111,13 @@ operators palette.
 | Alignment      | 3×3 anchor.                                                      |
 | Speed          | Playback speed multiplier.                                       |
 | Background Color | RGBA clear color. Set alpha = 0 for transparent output.        |
-| Resolution     | Width × height of the output texture.                            |
+
+Output size comes from the TOP's built-in **Common** page (Output
+Resolution / Resolution). "Use Input" means the artboard's own authored size.
+
+> **Upgrading from v1.3.0 or earlier:** the custom **Resolution** parameter on
+> the Rive page is gone. Projects that set it will come up at the artboard's
+> size; set the size on the Common page instead.
 
 ## Driving state machine inputs
 
@@ -176,10 +187,7 @@ for e in op('rive1').propertySchema:
 > was built without the schema endpoint, so TouchDesigner never built a Python
 > class for it. Confirm with
 > `python scripts/verify_python_endpoint.py <your>.dll` and see
-> [The CPython schema endpoint](#the-cpython-schema-endpoint). The prebuilt
-> Windows DLL in **v1.7.0-sparks** — the release that introduced these
-> attributes — is affected: CI built it without the endpoint. Rebuild from
-> source, or use a later release.
+> [The CPython schema endpoint](#the-cpython-schema-endpoint).
 
 The trick that makes `tdJSONPars` work without a lookup table: each entry
 carries the **Rive property path in its `label`**, not its name. A path
@@ -211,15 +219,19 @@ view-model image property it drives). Every cook, the TOP's pixels are
 pushed into the Rive image, so video, Render TOPs, NDI — anything — can
 feed artwork inside the .riv.
 
-Transport is automatic:
+Transport:
 
-- **Windows + NVIDIA**: the plugin registers itself in CUDA execute mode
-  and textures move GPU→GPU in both directions (input TOPs into Rive, and
-  the rendered frame back to TouchDesigner) with **zero CPU copies**.
-  Input TOPs must be RGBA 8-bit in this mode.
-- **macOS, or Windows without CUDA**: a CPU download path is used
-  (one frame of latency on injected textures, imperceptible in most
-  setups). The rendered frame is read back through CPU memory as before.
+- **Default (all platforms)**: a CPU download path (one frame of latency on
+  injected textures, imperceptible in most setups). On Windows the rendered
+  frame is read back through double-buffered staging, which also adds one
+  frame of output latency in exchange for not stalling on the GPU.
+- **Windows + NVIDIA, opt-in**: set the environment variable
+  `TDRIVE_CUDA=1` before launching TouchDesigner to register the plugin in
+  CUDA execute mode, where textures move GPU→GPU in both directions with
+  **zero CPU copies**. Input TOPs must be RGBA 8-bit. The mode applies to
+  every Rive TOP in the process and adds a fixed per-cook cost to each one
+  (measured ~9.5 ms vs ~1 ms), so enable it only when you inject large or
+  many textures. The Info CHOP's `cuda_mode` channel shows which mode loaded.
 
 Note: Rive samples images as **premultiplied alpha**. The CPU path
 premultiplies for you; in CUDA mode, premultiply upstream (e.g. a
