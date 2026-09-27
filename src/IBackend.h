@@ -33,12 +33,19 @@ constexpr int kMaxImageSlots = 4;
 // last completed renderAndReadback(). Surfaced as Info CHOP channels so the
 // cost can be attributed without a profiler - the CPU round-trip dominates at
 // high resolutions and it matters which part of it.
+// CPU wall-clock ms unless noted. In CUDA mode copy/map are the CUDA calls
+// (cudaMemcpy2DArrayToArray / cudaGraphicsMapResources) and memcpy is 0.
 struct ReadbackTimings {
     double renderMs = 0.0;   // beginFrame + draw + flush (GPU work submitted)
-    double copyMs   = 0.0;   // CopyResource GPU -> staging
-    double mapMs    = 0.0;   // Map(READ) - blocks until the GPU catches up
+    double copyMs   = 0.0;   // CopyResource GPU -> staging, or the CUDA copy
+    double mapMs    = 0.0;   // Map(READ) / cudaGraphicsMapResources
     double memcpyMs = 0.0;   // staging -> TouchDesigner's buffer
+    double unmapMs  = 0.0;   // cudaGraphicsUnmapResources (CUDA mode)
     double totalMs  = 0.0;
+    // GPU execution time of the Rive render, from D3D11 timestamp queries read
+    // back a few frames later so they never stall. 0 until a result arrives
+    // and on backends without the queries.
+    double renderGpuMs = 0.0;
 };
 
 class IBackend {
@@ -91,6 +98,17 @@ public:
     // True when this backend can move textures to/from CUDA arrays without a
     // CPU round-trip.
     virtual bool cudaInterop() const { return false; }
+
+    // The cudaStream_t all CUDA work of the NEXT bracket runs on, to be
+    // declared to TouchDesigner (TOP_CUDAOutputInfo / OP_CUDAAcquireInfo
+    // ::stream) before beginCUDAOperations. nullptr (the legacy default
+    // stream) until ensureCudaStream() has run once.
+    virtual void* cudaStream() const { return nullptr; }
+
+    // Create the dedicated stream if it doesn't exist yet. Call inside the
+    // CUDA bracket, after this cook's CUDA work, so the stream in use always
+    // matches the one declared to TouchDesigner for that cook.
+    virtual void ensureCudaStream() {}
 
     // Same contract as updateImageSlot, but the source pixels come from a
     // cudaArray* (RGBA8, as handed out by TouchDesigner in CUDA execute mode).

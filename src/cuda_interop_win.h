@@ -15,6 +15,7 @@
 
 #if defined(_WIN32)
 
+#include <cstddef>
 #include <cstdint>
 
 struct ID3D11Resource;
@@ -32,6 +33,20 @@ constexpr cudaError_t  kSuccess                  = 0;
 constexpr unsigned int kGraphicsRegisterFlagsNone = 0;
 constexpr int          kMemcpyDeviceToDevice      = 3;
 
+constexpr unsigned int kStreamNonBlocking         = 0x01;
+
+// ABI mirrors of the driver_types.h structs we pass by pointer.
+struct ChannelFormatDesc { int x, y, z, w; int f; };
+struct Extent            { size_t width, height, depth; };
+struct Pos               { size_t x, y, z; };
+struct PitchedPtr        { void* ptr; size_t pitch, xsize, ysize; };
+struct Memcpy3DParms {
+    cudaArray*  srcArray; Pos srcPos; PitchedPtr srcPtr;
+    cudaArray*  dstArray; Pos dstPos; PitchedPtr dstPtr;
+    Extent      extent;   // in elements when either side is an array
+    int         kind;
+};
+
 // Loads cudart (idempotent). Returns false if no cudart / no CUDA device.
 bool Load();
 
@@ -41,13 +56,15 @@ bool Load();
 // this is what decides TOP_ExecuteMode.
 bool AvailableForD3D11();
 
-// True when TDRIVE_CUDA is set to something other than "0" / "false" / "off".
+// False only when TDRIVE_CUDA is "0" / "false" / "off" - the opt-out.
 //
-// CUDA execute mode is OPT-IN. The execute mode is a process-wide, load-time
-// decision, so every cook of every Rive TOP pays the begin/endCUDAOperations
-// bracket, a D3D11 flush and a CUDA map/unmap round trip whether or not it
-// injects a texture - measured 9.5 ms against 1.2 ms on the same .riv.
-bool EnabledByEnv();
+// CUDA execute mode is the default wherever it is available, and process-wide:
+// it is decided at load time for every Rive TOP. At 60 fps TD reports ~4-5 ms
+// gpuCookTime per node in this mode, but a bare CUDA-mode TOP that writes
+// nothing reports ~4.2 ms too - it is TD's CUDA bracket timing a wait. Our CUDA
+// calls are ~0.5 ms, and uncapped with 1-8 nodes throughput matched or beat
+// CPUMem with 25-30% less CPU cook time (RTX 2070 SUPER, TD 2025.30280).
+bool AllowedByEnv();
 
 // Picks the DXGI adapter (by EnumAdapters ordinal) that maps to a CUDA
 // device. Returns -1 if none.
@@ -70,10 +87,15 @@ struct Api {
     cudaError_t (*graphicsSubResourceGetMappedArray)(
         cudaArray** array, cudaGraphicsResource_t resource,
         unsigned int arrayIndex, unsigned int mipLevel);
-    cudaError_t (*memcpy2DArrayToArray)(
-        cudaArray* dst, size_t wOffsetDst, size_t hOffsetDst,
-        const cudaArray* src, size_t wOffsetSrc, size_t hOffsetSrc,
-        size_t widthBytes, size_t height, int kind);
+    // cudaMemcpy2DArrayToArray has no stream variant; this is the one
+    // array-to-array copy that takes a stream.
+    cudaError_t (*memcpy3DAsync)(const Memcpy3DParms* p, cudaStream_t stream);
+    cudaError_t (*streamCreateWithFlags)(cudaStream_t* stream,
+                                         unsigned int flags);
+    cudaError_t (*streamDestroy)(cudaStream_t stream);
+    // The real allocated extent of a cudaArray, in elements.
+    cudaError_t (*arrayGetInfo)(ChannelFormatDesc* desc, Extent* extent,
+                                unsigned int* flags, cudaArray* array);
     const char* (*getErrorString)(cudaError_t err);
 };
 

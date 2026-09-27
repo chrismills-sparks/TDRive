@@ -221,17 +221,31 @@ feed artwork inside the .riv.
 
 Transport:
 
-- **Default (all platforms)**: a CPU download path (one frame of latency on
-  injected textures, imperceptible in most setups). On Windows the rendered
-  frame is read back through double-buffered staging, which also adds one
-  frame of output latency in exchange for not stalling on the GPU.
-- **Windows + NVIDIA, opt-in**: set the environment variable
-  `TDRIVE_CUDA=1` before launching TouchDesigner to register the plugin in
-  CUDA execute mode, where textures move GPU→GPU in both directions with
-  **zero CPU copies**. Input TOPs must be RGBA 8-bit. The mode applies to
-  every Rive TOP in the process and adds a fixed per-cook cost to each one
-  (measured ~9.5 ms vs ~1 ms), so enable it only when you inject large or
-  many textures. The Info CHOP's `cuda_mode` channel shows which mode loaded.
+- **Windows + NVIDIA (default there)**: the plugin registers in CUDA
+  execute mode, where textures move GPU→GPU in both directions with **zero
+  CPU copies**. Input TOPs must be RGBA 8-bit. The mode applies to every
+  Rive TOP in the process. To opt out, set the environment variable
+  `TDRIVE_CUDA=0` before launching TouchDesigner. The Info CHOP's
+  `cuda_mode` channel shows which mode loaded.
+- **macOS, Windows without NVIDIA, or `TDRIVE_CUDA=0`**: a CPU download
+  path (one frame of latency on injected textures, imperceptible in most
+  setups). On Windows the rendered frame is read back through double-buffered
+  staging, which also adds one frame of output latency in exchange for not
+  stalling on the GPU.
+
+  In the Performance Monitor a node in CUDA mode shows ~5 ms of GPU cook time
+  at 60 fps. That is TouchDesigner's GPU timer spanning an interop wait, not
+  work: a bare CUDA-mode TOP that writes nothing shows ~4.2 ms too, and
+  measured uncapped on an RTX 2070 SUPER with 1–8 nodes, CUDA mode
+  matched or beat the default mode's frame rate (475 vs 390 fps with one
+  node, equal at 4 and 8), used 25–30% less CPU cook time, had steadier frame
+  times, and has no extra frame of latency.
+
+The node's Info CHOP breaks the cost down per cook (milliseconds):
+`render_ms`, `copy_ms`, `map_ms`, `memcpy_ms`, `readback_total_ms`, plus in
+CUDA mode `unmap_ms`, `cuda_begin_ms`, `cuda_inject_ms` and `cuda_end_ms`.
+`render_gpu_ms` is Rive's own GPU render time (Windows), and `out_w` /
+`out_h` the size actually produced.
 
 Note: Rive samples images as **premultiplied alpha**. The CPU path
 premultiplies for you; in CUDA mode, premultiply upstream (e.g. a
@@ -257,3 +271,9 @@ Composite/Reorder TOP) if your input has transparency.
 - **Black output** — alpha = 0 in Background Color produces a transparent
   output. View it through a Composite TOP over a solid background to
   confirm the alpha is what you expect.
+- **Garbled output above 1280 on a Non-Commercial license** — TouchDesigner
+  Non-Commercial caps every TOP at 1280×1280. In CUDA mode the plugin detects
+  the smaller buffer, renders at that size and shows a warning. In the
+  default mode the plugin cannot see the cap (the C++ API doesn't expose it),
+  so it renders at the requested size and TD reads the frame with the wrong
+  row width. Keep both sides at 1280 or below on Non-Commercial.

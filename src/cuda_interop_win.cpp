@@ -83,7 +83,10 @@ bool Load()
     ok &= Resolve(m, "cudaGraphicsUnmapResources", gApi.graphicsUnmapResources);
     ok &= Resolve(m, "cudaGraphicsSubResourceGetMappedArray",
                   gApi.graphicsSubResourceGetMappedArray);
-    ok &= Resolve(m, "cudaMemcpy2DArrayToArray",   gApi.memcpy2DArrayToArray);
+    ok &= Resolve(m, "cudaMemcpy3DAsync",          gApi.memcpy3DAsync);
+    ok &= Resolve(m, "cudaStreamCreateWithFlags",  gApi.streamCreateWithFlags);
+    ok &= Resolve(m, "cudaStreamDestroy",          gApi.streamDestroy);
+    ok &= Resolve(m, "cudaArrayGetInfo",           gApi.arrayGetInfo);
     ok &= Resolve(m, "cudaGetErrorString",         gApi.getErrorString);
     if (!ok) return false;
 
@@ -123,11 +126,11 @@ bool AvailableForD3D11()
     return Load() && FindCUDAAdapterOrdinal() >= 0;
 }
 
-bool EnabledByEnv()
+bool AllowedByEnv()
 {
     char buf[16] = {};
     DWORD n = GetEnvironmentVariableA("TDRIVE_CUDA", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf)) return false;   // unset -> CPUMem
+    if (n == 0 || n >= sizeof(buf)) return true;   // unset -> CUDA if available
     return _stricmp(buf, "0")     != 0 &&
            _stricmp(buf, "false") != 0 &&
            _stricmp(buf, "off")   != 0;
