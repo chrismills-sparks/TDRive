@@ -221,10 +221,14 @@ elseif(TDRIVE_PYTHON AND APPLE)
     # macOS needs headers only. TD bundles CPython as an @rpath Python.framework
     # and each TD build ships a different 3.11.x, so rather than link one, the
     # Python symbols are left undefined and bound at load time to the
-    # interpreter TD already has loaded - how CPython extension modules are
-    # built on macOS. scripts/verify_python_endpoint.py fails the build if
-    # anything other than a Python symbol is left to that load-time lookup, so
-    # dynamic_lookup cannot hide a genuinely missing Rive or system symbol.
+    # interpreter TD already has loaded.
+    #
+    # Each allowed symbol is named with -U rather than using a blanket
+    # -undefined dynamic_lookup: that would hide a genuinely missing Rive or
+    # system symbol until TD loads the plugin, and older ld (macos-14 runner)
+    # also stops binding _objc_msgSend to libobjc under it. If you call a new
+    # CPython function, the link fails naming it - add it to this list.
+    # scripts/verify_python_endpoint.py re-checks the artifact.
     #
     # Accepted roots (TD_PYTHON_ROOT overrides the auto-discovery):
     #   TD's bundle     .../Python.framework/Versions/3.11  (include/python3.11/)
@@ -251,7 +255,13 @@ elseif(TDRIVE_PYTHON AND APPLE)
         message(STATUS "TDRive: CPython schema endpoint ON")
         message(STATUS "TDRive:   headers ${_tdrive_py_inc}")
         target_include_directories(TDRiveTOP PRIVATE "${_tdrive_py_inc}")
-        target_link_options(TDRiveTOP PRIVATE "LINKER:-undefined,dynamic_lookup")
+        set(_tdrive_py_symbols
+            PyBool_FromLong PyDict_New PyDict_SetItemString PyFloat_FromDouble
+            PyList_Append PyList_New PyLong_FromLong PyUnicode_FromString
+            _Py_Dealloc)
+        foreach(_sym IN LISTS _tdrive_py_symbols)
+            target_link_options(TDRiveTOP PRIVATE "LINKER:-U,_${_sym}")
+        endforeach()
         target_compile_definitions(TDRiveTOP PRIVATE
             TDRIVE_PYTHON
             Py_LIMITED_API=0x030B0000
@@ -283,10 +293,7 @@ if(APPLE)
     target_compile_options(TDRiveTOP PRIVATE
         $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     )
-    # objc explicitly: with -undefined dynamic_lookup (Python endpoint), older
-    # ld leaves _objc_msgSend to flat load-time lookup unless libobjc is named.
     target_link_libraries(TDRiveTOP PRIVATE
-        objc
         "-framework Foundation"
         "-framework CoreFoundation"
         "-framework Metal"

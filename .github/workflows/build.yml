@@ -96,8 +96,8 @@ jobs:
           key: rive-macos-${{ steps.rive.outputs.sha }}-v4
 
       - name: Verify CPython schema endpoint
-        # Also proves -undefined dynamic_lookup is hiding nothing but _Py*
-        # symbols. Runs before packaging so a bad binary never becomes a zip.
+        # Also proves nothing but _Py* symbols is left to load-time lookup.
+        # Runs before packaging so a bad binary never becomes a zip.
         run: python3 scripts/verify_python_endpoint.py build/TDRiveTOP.plugin/Contents/MacOS/TDRiveTOP
 
       - name: Package macOS plugin

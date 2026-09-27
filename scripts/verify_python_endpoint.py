@@ -25,11 +25,11 @@ Windows (PE):
    a DLL that does not import python3.dll cannot possibly serve it.
 
 macOS (Mach-O): the plugin links no libpython; its Python symbols are left to
-load-time lookup against TouchDesigner's interpreter (-undefined dynamic_lookup).
+load-time lookup against TouchDesigner's interpreter (per-symbol -U flags).
 1. At least one `_Py*` symbol is dynamically looked up - the endpoint is in.
-2. NOTHING else is dynamically looked up. dynamic_lookup applies to every
-   symbol, so a missing Rive or system symbol would otherwise link cleanly and
-   only fail when TouchDesigner loads the plugin.
+2. NOTHING else is dynamically looked up. A non-Python symbol left to
+   load-time lookup would link cleanly and only fail when TouchDesigner loads
+   the plugin (e.g. a stray -undefined dynamic_lookup).
 
 Both:
 - Every `gPyGetSets` name is present in the binary's data, which catches a
@@ -188,8 +188,8 @@ def check_macho(path: Path) -> list[str]:
         )
     if other:
         problems.append(
-            "-undefined dynamic_lookup is hiding non-Python symbols that nothing "
-            "at link time resolved; TouchDesigner would fail to load this plugin:\n"
+            "Non-Python symbols are left to load-time lookup; nothing at link "
+            "time resolved them, so TouchDesigner could fail to load this plugin:\n"
             + "\n".join(f"    {s}" for s in other)
         )
     return problems
