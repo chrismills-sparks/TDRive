@@ -52,6 +52,36 @@ cmake --build build --config Release
 :: -> build\Release\TDRiveTOP.dll
 ```
 
+### The CPython schema endpoint
+
+On Windows the plugin exposes its property schema to Python (see
+[Generating controls automatically](#generating-controls-automatically-rivecontroltox)),
+which needs Python 3.11 headers and `python3.lib` at build time. CMake finds
+them automatically from your newest TouchDesigner install, so a normal dev
+build needs no extra flags. Two roots are accepted if you need to point it
+elsewhere with `-DTD_PYTHON_ROOT=<path>`:
+
+| Layout | Headers | Import library |
+|---|---|---|
+| TouchDesigner's bundled SDK | `Include/Python.h` (+ `Include/PC/`) | `lib/x64/python3.lib` |
+| A stock CPython 3.11 install | `include/Python.h` | `libs/python3.lib` |
+
+The second is what `actions/setup-python` produces, which is how CI builds it
+— GitHub runners have no TouchDesigner to borrow the SDK from.
+
+**If CMake cannot resolve a root, configuring fails.** That is deliberate. The
+endpoint is compiled behind `#if defined(TDRIVE_PYTHON)`, so a build without
+it produces a plugin that loads and renders perfectly but has no Python
+attributes at all — indistinguishable from a broken install until someone
+touches `propertySchema`. If you want that build, ask for it explicitly with
+`-DTDRIVE_PYTHON=OFF`. To check any DLL you have been handed:
+
+```sh
+python scripts/verify_python_endpoint.py build/Release/TDRiveTOP.dll
+```
+
+macOS has no Python wiring yet; the plugin builds without the endpoint there.
+
 ## Install in TouchDesigner
 
 Drop the build output into TouchDesigner's plugin search path:
@@ -104,20 +134,73 @@ artboard — text on screen reads from view-model `string` / `number` /
 auto-binds the artboard's default view model when one exists.
 
 The **Strings DAT** parameter points at a Table DAT with two columns. Each
-row is `name` followed by `value`. An optional `name value` header row is
-skipped if the first cell of row 0 is exactly `name` / `Name` / `key` /
-`Key`. For each row:
+row is `name` followed by `value`. An optional header row is skipped if the
+first cell of row 0 is exactly `name` / `Name` / `key` / `Key` /
+`label` / `Label`. For each row:
 
 - If a view-model property with that name exists, the value is coerced to
   the property's type (`string`, `number`, `bool`) and written. Triggers
   fire on a rising edge — when the cell content changes AND parses to a
   truthy value (`1`, `true`, `fire`, `on`, `yes`, or a positive number).
+- Otherwise, if the selected state machine declares an input with that
+  name, the value is applied to it. The **Inputs CHOP** stays the better
+  path for *animated* numerics — no float→string→float round trip per
+  frame — but this lets one DAT drive an entire artboard.
 - Otherwise, the TOP falls back to `artboard->getTextRun(name, "")` so
   older files (named text runs, no view model) keep working.
 
 The Info DAT lists `vm:string` / `vm:number` / `vm:bool` / `vm:trigger`
 rows for each view-model property, alongside the SMI inputs. Use it as the
 reference when populating your Strings DAT.
+
+## Generating controls automatically (RiveControl.tox)
+
+Filling a Strings DAT by hand gets old fast — `sanabrandv008.riv` exposes
+46 properties. The TOP therefore publishes its schema to Python, and
+`RiveControl.tox` in this repo turns that into parameters with one pulse.
+
+Three read-only attributes on the node:
+
+| Attribute | Returns |
+|---|---|
+| `schemaVersion` | Format version of the two below, so a consumer can detect drift. |
+| `propertySchema` | Every addressable property: `index`, `source` (`smi`/`vm`), `path`, `type`, `value`, `options`, `container`. |
+| `tdJSONPars` | The drivable subset, as TDJSON parameter dicts ready for `TDJSON.addParametersFromJSONList`. |
+
+```python
+for e in op('rive1').propertySchema:
+    print(e['path'], e['type'], e['value'])
+```
+
+> **If those attributes raise `AttributeError`,** the node is fine — your DLL
+> was built without the schema endpoint, so TouchDesigner never built a Python
+> class for it. Confirm with
+> `python scripts/verify_python_endpoint.py <your>.dll` and see
+> [The CPython schema endpoint](#the-cpython-schema-endpoint). The prebuilt
+> Windows DLL in **v1.7.0-sparks** — the release that introduced these
+> attributes — is affected: CI built it without the endpoint. Rebuild from
+> source, or use a later release.
+
+The trick that makes `tdJSONPars` work without a lookup table: each entry
+carries the **Rive property path in its `label`**, not its name. A path
+like `payoffCard/barGraph1Label` is not a legal TouchDesigner parameter
+name, but it is a perfectly legal label — so a Parameter DAT set to emit
+labels (`name=False, label=True, header=False`) produces exactly the
+two-column table the Strings DAT parameter already consumes.
+
+**Using the component:** drop `RiveControl.tox` into your project, set its
+**Rive TOP** parameter, and pulse **Build**. It generates one parameter per
+addressable property (grouped onto a page per nested view model) and points
+that TOP's Strings DAT at its own output. Build is get-or-create, so
+re-running it after changing artboard or file adds and updates parameters
+without disturbing values you have already set. **Clear** removes the
+generated parameters — separate from Build precisely because it discards
+their values, expressions and exports.
+
+Properties with no write path (`vm:viewModel` containers, `vm:list`,
+`vm:color`, `vm:image`, `vm:font`) are deliberately skipped rather than
+generated as parameters that would do nothing; the Status parameter reports
+how many.
 
 ## Injecting textures (view-model image properties)
 

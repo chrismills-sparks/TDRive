@@ -183,8 +183,42 @@ jobs:
         # its objects are linked directly into librive.
         run: scripts\build_rive.bat release -- rive rive_pls_renderer rive_decoders rive_harfbuzz rive_sheenbidi rive_yoga libpng libjpeg libwebp zlib miniaudio luau_vm
 
+      - name: Setup Python 3.11
+        # The CPython schema endpoint (pythonGetSets) needs Python headers and
+        # python3.lib at build time. On a dev box CMake borrows them from a
+        # TouchDesigner install; this runner has no TouchDesigner, so we supply
+        # a stock CPython instead and point TD_PYTHON_ROOT at it below. Without
+        # this the old CMake lookup missed, warned, and shipped a plugin with
+        # the whole endpoint compiled out - see v1.7.0-sparks.
+        #
+        # 3.11 deliberately: it matches Py_LIMITED_API=0x030B0000 in
+        # CMakeLists.txt, the PEP 384 floor TD 2023+ ships. The stable ABI is
+        # what lets one DLL serve 3.11.1 (2023.x) through 3.11.15 (2025.33230),
+        # so the patch level here does not matter - the major.minor does.
+        #
+        # Placed after the Rive build so it cannot perturb premake/ninja.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Configure plugin
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        shell: pwsh
+        run: |
+          # setup-python exports pythonLocation; its layout is
+          # <root>/include/Python.h + <root>/libs/python3.lib, the second of the
+          # two roots CMakeLists.txt accepts.
+          if (-not $env:pythonLocation) {
+            throw "pythonLocation is unset - the Setup Python step did not run."
+          }
+          $pyRoot = $env:pythonLocation -replace '\\', '/'   # CMake wants forward slashes
+          Write-Host "TD_PYTHON_ROOT=$pyRoot"
+          # Echo the two files CMake requires. If setup-python ever changes its
+          # layout, this turns a terse configure failure into an obvious one.
+          foreach ($f in 'include/Python.h', 'libs/python3.lib') {
+            $p = Join-Path $pyRoot $f
+            Write-Host ("  {0,-20} {1}" -f $f, $(if (Test-Path $p) { 'found' } else { 'MISSING' }))
+          }
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DTD_PYTHON_ROOT="$pyRoot"
 
       - name: Build plugin
         run: cmake --build build --config Release --parallel
@@ -198,6 +232,21 @@ jobs:
         with:
           path: third_party/rive-runtime/renderer/out
           key: rive-windows-${{ steps.rive.outputs.sha }}-v4
+
+      - name: Verify CPython schema endpoint
+        # Gate the artifact on what it actually contains, not on the build
+        # having gone green. A plugin missing TDRIVE_PYTHON compiles, links,
+        # loads and renders normally - the only symptom is that every
+        # documented Python attribute raises AttributeError in TouchDesigner.
+        # CMake is now fatal when it cannot find a Python SDK, but this checks
+        # the DLL itself, so no configuration change can quietly undo it.
+        # Runs BEFORE packaging so a stripped DLL never becomes a zip.
+        #
+        # Windows only: the macOS plugin has no Python wiring yet (the
+        # elseif(TDRIVE_PYTHON) branch in CMakeLists.txt), so there is nothing
+        # to verify in that job.
+        shell: pwsh
+        run: python scripts/verify_python_endpoint.py build\Release\TDRiveTOP.dll
 
       - name: Package Windows plugin
         # Bake the pinned Rive tag into the zip name so downloaders can see

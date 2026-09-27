@@ -41,6 +41,20 @@ bool Load();
 // this is what decides TOP_ExecuteMode.
 bool AvailableForD3D11();
 
+// True when TDRIVE_CUDA is set to something other than "0" / "false" / "off".
+//
+// CUDA execute mode is OPT-IN in this fork. Upstream selects it automatically
+// wherever the hardware supports it, but as shipped that path renders the frame
+// vertically flipped (the CPUMem path tells TouchDesigner
+// firstPixel = TopLeft; TOP_CUDAOutputInfo has no equivalent field, so nothing
+// flips the D3D11 rows we copy in), breaks the Artboard / State Machine menus
+// (TouchDesigner refuses OP_Inputs access once beginCUDAOperations() has run
+// for a node), and costs roughly 8x the cook time - measured 9.5 ms against
+// 1.2 ms on the same .riv - because every cook of every Rive TOP pays the
+// begin/endCUDAOperations bracket, a D3D11 flush and a CUDA map/unmap round
+// trip whether or not it injects a texture.
+bool EnabledByEnv();
+
 // Picks the DXGI adapter (by EnumAdapters ordinal) that maps to a CUDA
 // device. Returns -1 if none.
 int FindCUDAAdapterOrdinal();
