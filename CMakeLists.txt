@@ -283,7 +283,10 @@ if(APPLE)
     target_compile_options(TDRiveTOP PRIVATE
         $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     )
+    # objc explicitly: with -undefined dynamic_lookup (Python endpoint), older
+    # ld leaves _objc_msgSend to flat load-time lookup unless libobjc is named.
     target_link_libraries(TDRiveTOP PRIVATE
+        objc
         "-framework Foundation"
         "-framework CoreFoundation"
         "-framework Metal"
