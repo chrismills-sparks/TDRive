@@ -52,6 +52,41 @@ cmake --build build --config Release
 :: -> build\Release\TDRiveTOP.dll
 ```
 
+### The CPython schema endpoint
+
+On Windows the plugin exposes its property schema to Python (see
+[Generating controls automatically](#generating-controls-automatically-rivecontroltox)),
+which needs Python 3.11 headers and `python3.lib` at build time. CMake finds
+them automatically from your newest TouchDesigner install, so a normal dev
+build needs no extra flags. Two roots are accepted if you need to point it
+elsewhere with `-DTD_PYTHON_ROOT=<path>`:
+
+| Layout | Headers | Import library |
+|---|---|---|
+| TouchDesigner's bundled SDK | `Include/Python.h` (+ `Include/PC/`) | `lib/x64/python3.lib` |
+| A stock CPython 3.11 install | `include/Python.h` | `libs/python3.lib` |
+
+The second is what `actions/setup-python` produces, which is how CI builds it
+— GitHub runners have no TouchDesigner to borrow the SDK from.
+
+**If CMake cannot resolve a root, configuring fails.** That is deliberate. The
+endpoint is compiled behind `#if defined(TDRIVE_PYTHON)`, so a build without
+it produces a plugin that loads and renders perfectly but has no Python
+attributes at all — indistinguishable from a broken install until someone
+touches `propertySchema`. If you want that build, ask for it explicitly with
+`-DTDRIVE_PYTHON=OFF`. To check any DLL you have been handed:
+
+```sh
+python scripts/verify_python_endpoint.py build/Release/TDRiveTOP.dll
+python3 scripts/verify_python_endpoint.py build/TDRiveTOP.plugin/Contents/MacOS/TDRiveTOP
+```
+
+On macOS, CMake finds the headers in
+`/Applications/TouchDesigner*.app/Contents/Frameworks/Python.framework/Versions/3.11`
+(or any CPython 3.11 root passed as `TD_PYTHON_ROOT`). The plugin links no
+libpython: its Python symbols bind at load time to the interpreter
+TouchDesigner already has loaded, so one build runs on every TD 2023+ install.
+
 ## Install in TouchDesigner
 
 Drop the build output into TouchDesigner's plugin search path:
@@ -76,7 +111,13 @@ operators palette.
 | Alignment      | 3×3 anchor.                                                      |
 | Speed          | Playback speed multiplier.                                       |
 | Background Color | RGBA clear color. Set alpha = 0 for transparent output.        |
-| Resolution     | Width × height of the output texture.                            |
+
+Output size comes from the TOP's built-in **Common** page (Output
+Resolution / Resolution). "Use Input" means the artboard's own authored size.
+
+> **Upgrading from v1.3.0 or earlier:** the custom **Resolution** parameter on
+> the Rive page is gone. Projects that set it will come up at the artboard's
+> size; set the size on the Common page instead.
 
 ## Driving state machine inputs
 
@@ -104,20 +145,70 @@ artboard — text on screen reads from view-model `string` / `number` /
 auto-binds the artboard's default view model when one exists.
 
 The **Strings DAT** parameter points at a Table DAT with two columns. Each
-row is `name` followed by `value`. An optional `name value` header row is
-skipped if the first cell of row 0 is exactly `name` / `Name` / `key` /
-`Key`. For each row:
+row is `name` followed by `value`. An optional header row is skipped if the
+first cell of row 0 is exactly `name` / `Name` / `key` / `Key` /
+`label` / `Label`. For each row:
 
 - If a view-model property with that name exists, the value is coerced to
   the property's type (`string`, `number`, `bool`) and written. Triggers
   fire on a rising edge — when the cell content changes AND parses to a
   truthy value (`1`, `true`, `fire`, `on`, `yes`, or a positive number).
+- Otherwise, if the selected state machine declares an input with that
+  name, the value is applied to it. The **Inputs CHOP** stays the better
+  path for *animated* numerics — no float→string→float round trip per
+  frame — but this lets one DAT drive an entire artboard.
 - Otherwise, the TOP falls back to `artboard->getTextRun(name, "")` so
   older files (named text runs, no view model) keep working.
 
 The Info DAT lists `vm:string` / `vm:number` / `vm:bool` / `vm:trigger`
 rows for each view-model property, alongside the SMI inputs. Use it as the
 reference when populating your Strings DAT.
+
+## Generating controls automatically (RiveControl.tox)
+
+Filling a Strings DAT by hand gets old fast — `sanabrandv008.riv` exposes
+46 properties. The TOP therefore publishes its schema to Python, and
+`RiveControl.tox` in this repo turns that into parameters with one pulse.
+
+Three read-only attributes on the node:
+
+| Attribute | Returns |
+|---|---|
+| `schemaVersion` | Format version of the two below, so a consumer can detect drift. |
+| `propertySchema` | Every addressable property: `index`, `source` (`smi`/`vm`), `path`, `type`, `value`, `options`, `container`. |
+| `tdJSONPars` | The drivable subset, as TDJSON parameter dicts ready for `TDJSON.addParametersFromJSONList`. |
+
+```python
+for e in op('rive1').propertySchema:
+    print(e['path'], e['type'], e['value'])
+```
+
+> **If those attributes raise `AttributeError`,** the node is fine — your DLL
+> was built without the schema endpoint, so TouchDesigner never built a Python
+> class for it. Confirm with
+> `python scripts/verify_python_endpoint.py <your>.dll` and see
+> [The CPython schema endpoint](#the-cpython-schema-endpoint).
+
+The trick that makes `tdJSONPars` work without a lookup table: each entry
+carries the **Rive property path in its `label`**, not its name. A path
+like `payoffCard/barGraph1Label` is not a legal TouchDesigner parameter
+name, but it is a perfectly legal label — so a Parameter DAT set to emit
+labels (`name=False, label=True, header=False`) produces exactly the
+two-column table the Strings DAT parameter already consumes.
+
+**Using the component:** drop `RiveControl.tox` into your project, set its
+**Rive TOP** parameter, and pulse **Build**. It generates one parameter per
+addressable property (grouped onto a page per nested view model) and points
+that TOP's Strings DAT at its own output. Build is get-or-create, so
+re-running it after changing artboard or file adds and updates parameters
+without disturbing values you have already set. **Clear** removes the
+generated parameters — separate from Build precisely because it discards
+their values, expressions and exports.
+
+Properties with no write path (`vm:viewModel` containers, `vm:list`,
+`vm:color`, `vm:image`, `vm:font`) are deliberately skipped rather than
+generated as parameters that would do nothing; the Status parameter reports
+how many.
 
 ## Injecting textures (view-model image properties)
 
@@ -128,15 +219,19 @@ view-model image property it drives). Every cook, the TOP's pixels are
 pushed into the Rive image, so video, Render TOPs, NDI — anything — can
 feed artwork inside the .riv.
 
-Transport is automatic:
+Transport:
 
-- **Windows + NVIDIA**: the plugin registers itself in CUDA execute mode
-  and textures move GPU→GPU in both directions (input TOPs into Rive, and
-  the rendered frame back to TouchDesigner) with **zero CPU copies**.
-  Input TOPs must be RGBA 8-bit in this mode.
-- **macOS, or Windows without CUDA**: a CPU download path is used
-  (one frame of latency on injected textures, imperceptible in most
-  setups). The rendered frame is read back through CPU memory as before.
+- **Default (all platforms)**: a CPU download path (one frame of latency on
+  injected textures, imperceptible in most setups). On Windows the rendered
+  frame is read back through double-buffered staging, which also adds one
+  frame of output latency in exchange for not stalling on the GPU.
+- **Windows + NVIDIA, opt-in**: set the environment variable
+  `TDRIVE_CUDA=1` before launching TouchDesigner to register the plugin in
+  CUDA execute mode, where textures move GPU→GPU in both directions with
+  **zero CPU copies**. Input TOPs must be RGBA 8-bit. The mode applies to
+  every Rive TOP in the process and adds a fixed per-cook cost to each one
+  (measured ~9.5 ms vs ~1 ms), so enable it only when you inject large or
+  many textures. The Info CHOP's `cuda_mode` channel shows which mode loaded.
 
 Note: Rive samples images as **premultiplied alpha**. The CPU path
 premultiplies for you; in CUDA mode, premultiply upstream (e.g. a

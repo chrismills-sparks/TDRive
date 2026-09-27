@@ -5,6 +5,8 @@
 #include "TDRiveTOP.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -15,6 +17,7 @@
 #include "rive/scene.hpp"
 #include "rive/layout.hpp"
 #include "rive/math/aabb.hpp"
+#include "rive/math/mat2d.hpp"
 #include "rive/animation/linear_animation_instance.hpp"
 #include "rive/animation/state_machine_input_instance.hpp"
 #include "rive/text/text_value_run.hpp"
@@ -30,6 +33,15 @@
 #include "cuda_interop_win.h"
 #endif
 
+#if defined(TDRIVE_PYTHON)
+// Python.h comes AFTER the TD SDK headers on purpose. CPlusPlus_Common.hpp
+// forward-declares PyObject / PyGetSetDef / PyMethodDef behind
+// `#ifndef PyObject_HEAD`; re-typedef'ing the same type is legal in C++, so
+// either order compiles. This matches Derivative's own CHOPWithPythonClass
+// sample, which includes the SDK header first and Python.h in the .cpp.
+#include <Python.h>
+#endif
+
 using namespace TD;
 
 // =============================================================================
@@ -40,6 +52,21 @@ namespace {
 
 constexpr uint32_t kDefaultWidth  = 1280;
 constexpr uint32_t kDefaultHeight = 720;
+
+#if defined(TDRIVE_PYTHON)
+// customOPInfo.pythonVersion is TD's load-time gate on plugins that hand back
+// CPython objects. The SDK says to pass PY_VERSION from the headers you built
+// against, and Derivative's own sample does exactly that - but that pins the
+// DLL to a single CPython PATCH release, and TD's patch level moves: 2023.x
+// ships 3.11.1, 2025.32460 ships 3.11.10, 2025.33230 ships 3.11.15.
+//
+// We build against the PEP 384 stable ABI (Py_LIMITED_API + python3.lib), so
+// the binary genuinely runs on any of them, and we report the 3.11 floor
+// instead of the patch we happened to compile on. The real ABI gate is the
+// import library, not this string: on a host without a matching python3.dll
+// the import simply fails to resolve and the DLL never loads at all.
+constexpr const char* kTDRivePythonVersion = "3.11.1";
+#endif
 
 // SMI input type keys from rive/generated/animation/state_machine_*_base.hpp.
 constexpr uint16_t kInputTypeNumber  = 56;
@@ -105,6 +132,19 @@ rive::Alignment AlignmentFromIndex(int idx)
         case 8: return rive::Alignment::bottomRight;
         default: return rive::Alignment::center;
     }
+}
+
+// Joins the valid values for a property into the Info DAT's "options" cell.
+// Comma separated, because Rive enum values and artboard names routinely
+// contain spaces - a space separator would be ambiguous to split on.
+std::string join_options(const std::vector<std::string>& v)
+{
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) out += ',';
+        out += v[i];
+    }
+    return out;
 }
 
 bool dat_value_truthy(const std::string& s)
@@ -238,16 +278,8 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
         np.maxSliders[0] = 4.0;
         m->appendFloat(np);
     }
-    {
-        OP_NumericParameter np("Resolution");
-        np.label = "Resolution";
-        np.page  = "Rive";
-        np.defaultValues[0] = (double)kDefaultWidth;
-        np.defaultValues[1] = (double)kDefaultHeight;
-        np.minSliders[0] = 16;  np.maxSliders[0] = 4096;
-        np.minSliders[1] = 16;  np.maxSliders[1] = 4096;
-        m->appendWH(np);
-    }
+    // NOTE: no custom Resolution parameter. The output size comes from the
+    // node's built-in Common page, like any other TOP - see computeResolution().
     // Texture injection: each slot pairs a source TOP with the name of the
     // view-model image property it drives (see the Info DAT for the "vm:image"
     // properties the loaded .riv exposes).
@@ -312,18 +344,37 @@ void TDRiveTOP::getErrorString(OP_String* err, void*)
 void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
                                  OP_BuildDynamicMenuInfo* info, void*)
 {
-    if (!mBackendReady) {
-        std::string err;
-        if (mBackend && mBackend->init(err)) {
-            mBackendReady = true;
-        } else {
-            if (!err.empty()) setError(err);
-            return;
-        }
-    }
+    // In CUDA execute mode TouchDesigner refuses OP_Inputs/OP_Parameters for a
+    // node once beginCUDAOperations() has run for it:
+    //
+    //   Error: OP_Inputs and OP_Parameters can not be used after
+    //          beginCUDAOperations() has been called.
+    //
+    // This callback fires outside execute(), so reading a parameter here is
+    // what left both menus empty in CUDA mode - the plugin's bug, not
+    // TouchDesigner's. Nothing here actually needs a parameter: the loaded file
+    // and the selected artboard are already cached from the last cook, so in
+    // CUDA mode we serve the menus from that cache and never touch 'inputs'.
+    //
+    // The cost is that a node which has not cooked yet has no file to list.
+    // getGeneralInfo() sets cookEveryFrame, so that resolves itself on the next
+    // frame rather than needing the menu to be reopened.
+    const bool useInputs = !gCUDAMode;
 
-    const char* path = inputs->getParFilePath("File");
-    if (!loadFileIfNeeded(path)) return;
+    if (useInputs) {
+        if (!mBackendReady) {
+            std::string err;
+            if (mBackend && mBackend->init(err)) {
+                mBackendReady = true;
+            } else {
+                if (!err.empty()) setError(err);
+                return;
+            }
+        }
+        const char* path = inputs->getParFilePath("File");
+        if (!loadFileIfNeeded(path)) return;
+    }
+    if (!mFile) return;
 
     std::string name = info->name ? info->name : "";
 
@@ -336,9 +387,13 @@ void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
     }
 
     if (name == "Statemachine") {
-        const char* abName = inputs->getParString("Artboard");
+        // mLoadedArtboard is what the last cook actually selected, which is the
+        // same value the Artboard parameter holds by the time the menu opens.
+        const char* abPar  = useInputs ? inputs->getParString("Artboard") : nullptr;
+        const std::string abName = (abPar && *abPar) ? std::string(abPar)
+                                                     : mLoadedArtboard;
         rive::Artboard* ab = nullptr;
-        if (abName && *abName) ab = mFile->artboard(std::string(abName));
+        if (!abName.empty()) ab = mFile->artboard(abName);
         if (!ab) ab = mFile->artboard();
         if (!ab) return;
         for (size_t i = 0; i < ab->stateMachineCount(); ++i) {
@@ -351,16 +406,170 @@ void TDRiveTOP::buildDynamicMenu(const OP_Inputs* inputs,
 }
 
 // =============================================================================
+// Info CHOP - readback cost breakdown
+// =============================================================================
+
+// Where a cook's time actually went, in milliseconds, for the last frame, plus
+// which execute mode produced it.
+//
+// The CPU round-trip (render -> staging -> map -> memcpy -> hand to TD) is the
+// dominant cost at high resolutions, and these channels say which part of it so
+// the attribution doesn't have to be guessed. cuda_mode is 1 when the plugin
+// registered TOP_ExecuteMode::CUDA (TDRIVE_CUDA=1 and a usable NVIDIA adapter)
+// and 0 for the default CPUMem path - worth having on the node itself, because
+// the env var is set before TouchDesigner launches and there is otherwise no
+// way to tell from inside which mode you ended up in. In CUDA mode the frame
+// never touches the CPU, so the four timing channels all read 0.
+namespace {
+constexpr const char* kInfoChanNames[] = {
+    "render_ms", "copy_ms", "map_ms", "memcpy_ms", "readback_total_ms",
+    "cuda_mode",
+};
+constexpr int32_t kNumInfoChans =
+    (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
+} // namespace
+
+int32_t TDRiveTOP::getNumInfoCHOPChans(void*)
+{
+    return kNumInfoChans;
+}
+
+void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
+{
+    if (!chan || index < 0 || index >= kNumInfoChans) return;
+    const tdrive::ReadbackTimings t =
+        mBackend ? mBackend->lastTimings() : tdrive::ReadbackTimings{};
+    const double values[] = {
+        t.renderMs, t.copyMs, t.mapMs, t.memcpyMs, t.totalMs,
+        gCUDAMode ? 1.0 : 0.0,
+    };
+    // These two lists are indexed by the same 'index'; keep them in step.
+    static_assert((int32_t)(sizeof(values) / sizeof(values[0])) == kNumInfoChans,
+                  "kInfoChanNames and values must have the same length");
+    chan->name->setString(kInfoChanNames[index]);
+    chan->value = (float)values[index];
+}
+
+// =============================================================================
 // Info DAT
 // =============================================================================
 
+// Flattens both generations of Rive input into one list: state-machine
+// inputs first, then the view-model tree. Everything that reports the
+// artboard's input surface - the Info DAT, the node's Python schema - goes
+// through here, so a value only has to be formatted once.
+std::vector<TDRiveTOP::SchemaEntry> TDRiveTOP::propertySchema()
+{
+    std::vector<SchemaEntry> out;
+    char buf[64];
+
+    // ---- State-machine inputs (the original API: flat, three types) -------
+    if (auto* smi = currentSMI()) {
+        out.reserve(smi->inputCount() + mVmProps.size());
+        for (size_t i = 0; i < smi->inputCount(); ++i) {
+            auto* in = smi->input(i);
+            if (!in) continue;
+
+            SchemaEntry e;
+            e.source = "smi";
+            e.path   = in->name();
+            e.type   = InputTypeName(in->inputCoreType());
+
+            switch (in->inputCoreType()) {
+                case kInputTypeNumber:
+                    std::snprintf(buf, sizeof(buf), "%g",
+                                  static_cast<rive::SMINumber*>(in)->value());
+                    e.value = buf;
+                    break;
+                case kInputTypeBool:
+                    e.value   = static_cast<rive::SMIBool*>(in)->value() ? "1" : "0";
+                    e.options = {"0", "1"};
+                    break;
+                case kInputTypeTrigger:
+                    e.value = "(pulse)";
+                    break;
+                default:
+                    break;
+            }
+            out.push_back(std::move(e));
+        }
+    } else {
+        out.reserve(mVmProps.size());
+    }
+
+    // ---- View-model tree (data binding: nested, many types) ---------------
+    if (!mVMRuntime) return out;
+
+    for (const auto& p : mVmProps) {
+        // Full path, so a nested property reads as "payoffCard/title" - that
+        // string is exactly what the Strings DAT wants in its name column, and
+        // what Rive's own path-taking accessors below expect.
+        const std::string&   path = p.path;
+        const rive::DataType type = p.type;
+
+        SchemaEntry e;
+        e.source    = "vm";
+        e.path      = path;
+        e.type      = DataTypeName(type);
+        e.container = (type == rive::DataType::viewModel);
+
+        switch (type) {
+            case rive::DataType::string: {
+                auto* sp = mVMRuntime->propertyString(path);
+                if (sp) e.value = sp->value();
+                break;
+            }
+            case rive::DataType::number: {
+                if (auto* np = mVMRuntime->propertyNumber(path)) {
+                    std::snprintf(buf, sizeof(buf), "%g", np->value());
+                    e.value = buf;
+                }
+                break;
+            }
+            case rive::DataType::boolean: {
+                auto* bp = mVMRuntime->propertyBoolean(path);
+                if (bp) e.value = bp->value() ? "1" : "0";
+                e.options = {"0", "1"};
+                break;
+            }
+            case rive::DataType::trigger:
+                e.value = "(pulse)";
+                break;
+            case rive::DataType::enumType: {
+                if (auto* ep = mVMRuntime->propertyEnum(path)) {
+                    e.value   = ep->value();
+                    e.options = ep->values();
+                }
+                break;
+            }
+            case rive::DataType::artboard: {
+                if (auto* ap = mVMRuntime->propertyArtboard(path))
+                    e.value = ap->artboardName();
+                // An artboard property accepts any artboard in the file.
+                if (mFile) {
+                    e.options.reserve(mFile->artboardCount());
+                    for (size_t i = 0; i < mFile->artboardCount(); ++i)
+                        e.options.push_back(mFile->artboardNameAt(i));
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        out.push_back(std::move(e));
+    }
+
+    return out;
+}
+
 bool TDRiveTOP::getInfoDATSize(OP_InfoDATSize* size, void*)
 {
-    auto* smi = currentSMI();
-    int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
-    int32_t vmRows  = mVMRuntime ? (int32_t)mVMRuntime->propertyCount() : 0;
-    size->cols = 4;
-    size->rows = 1 + smiRows + vmRows;
+    // Built here rather than per row: TD asks for the size before it walks
+    // the rows, so one rebuild covers the whole table.
+    mSchemaCache = propertySchema();
+    size->cols = 5;
+    size->rows = 1 + (int32_t)mSchemaCache.size();
     size->byColumn = false;
     return true;
 }
@@ -373,77 +582,25 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
         entries->values[1]->setString("name");
         entries->values[2]->setString("type");
         entries->values[3]->setString("value");
+        entries->values[4]->setString("options");
         return;
     }
 
-    auto* smi = currentSMI();
-    int32_t smiRows = smi ? (int32_t)smi->inputCount() : 0;
-    int32_t k = row - 1;
-    char buf[64];
+    // Defensive even though getInfoDATSize() runs first: a stale row index
+    // would otherwise read off the end of the cache.
+    const int32_t k = row - 1;
+    if (k < 0 || (size_t)k >= mSchemaCache.size()) return;
+    const SchemaEntry& e = mSchemaCache[(size_t)k];
 
-    if (k < smiRows) {
-        auto* in = smi->input((size_t)k);
-        std::snprintf(buf, sizeof(buf), "%d", k);
-        entries->values[0]->setString(buf);
-        entries->values[1]->setString(in->name().c_str());
-        entries->values[2]->setString(InputTypeName(in->inputCoreType()));
-        switch (in->inputCoreType()) {
-            case kInputTypeNumber: {
-                auto* n = static_cast<rive::SMINumber*>(in);
-                std::snprintf(buf, sizeof(buf), "%g", n->value());
-                entries->values[3]->setString(buf);
-                break;
-            }
-            case kInputTypeBool: {
-                auto* b = static_cast<rive::SMIBool*>(in);
-                entries->values[3]->setString(b->value() ? "1" : "0");
-                break;
-            }
-            case kInputTypeTrigger:
-                entries->values[3]->setString("(pulse)");
-                break;
-            default:
-                entries->values[3]->setString("");
-                break;
-        }
-        return;
-    }
-
-    if (!mVMRuntime) return;
-    int32_t vk = k - smiRows;
-    auto props = mVMRuntime->properties();
-    if (vk < 0 || (size_t)vk >= props.size()) return;
-    const auto& p = props[(size_t)vk];
-
-    std::snprintf(buf, sizeof(buf), "%d", vk);
+    // One monotonic index across BOTH blocks. It used to restart at 0 at the
+    // state-machine/view-model boundary, so two rows could share an index.
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d", k);
     entries->values[0]->setString(buf);
-    entries->values[1]->setString(p.name.c_str());
-    entries->values[2]->setString(DataTypeName(p.type));
-
-    switch (p.type) {
-        case rive::DataType::string: {
-            auto* sp = mVMRuntime->propertyString(p.name);
-            entries->values[3]->setString(sp ? sp->value().c_str() : "");
-            break;
-        }
-        case rive::DataType::number: {
-            auto* np = mVMRuntime->propertyNumber(p.name);
-            if (np) { std::snprintf(buf, sizeof(buf), "%g", np->value()); entries->values[3]->setString(buf); }
-            else    { entries->values[3]->setString(""); }
-            break;
-        }
-        case rive::DataType::boolean: {
-            auto* bp = mVMRuntime->propertyBoolean(p.name);
-            entries->values[3]->setString(bp ? (bp->value() ? "1" : "0") : "");
-            break;
-        }
-        case rive::DataType::trigger:
-            entries->values[3]->setString("(pulse)");
-            break;
-        default:
-            entries->values[3]->setString("");
-            break;
-    }
+    entries->values[1]->setString(e.path.c_str());
+    entries->values[2]->setString(e.type.c_str());
+    entries->values[3]->setString(e.value.c_str());
+    entries->values[4]->setString(join_options(e.options).c_str());
 }
 
 // =============================================================================
@@ -509,11 +666,45 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
                  ? std::string("No default artboard in file.")
                  : std::string("Artboard not found: ") + name);
         mArtboard.reset(); mScene.reset(); mSMI = nullptr;
+        mLoadedStateMachine.clear();
         return false;
     }
+
+    // Tear down everything derived from the OUTGOING artboard before it is
+    // destroyed, and in this order.
+    //
+    // mScene is a StateMachineInstance built from the current ArtboardInstance
+    // and holds raw pointers into its components, so it must be destroyed while
+    // that artboard is still alive - resetting it after the assignment below
+    // would run ~StateMachineInstance against freed memory.
+    //
+    // mLoadedStateMachine must be cleared too: selectSceneIfNeeded() short
+    // circuits on "mScene && sm == mLoadedStateMachine", so leaving the name set
+    // makes the next cook reuse a Scene belonging to an artboard that no longer
+    // exists. execute() then calls advanceAndApply() on it, which walks dead
+    // components and aborts in _purecall - the crash on switching artboards.
+    mScene.reset();
+    mSMI = nullptr;
+    mLoadedStateMachine.clear();
+
     mArtboard = std::move(ab);
     mLoadedArtboard = name;
-    mSMI = nullptr;
+
+    // Snapshot the artboard's authored frame NOW, before anything advances it.
+    //
+    // This has to be our own snapshot. Rive's own Artboard::originalWidth() is
+    // populated from the width/height properties in Artboard::deserialize(),
+    // and for every .riv tested here it stays 0 - the artboard carries its size
+    // some other way, so that case never fires. width()/height() ARE correct at
+    // this point, but only until the first advance: the layout pass writes its
+    // own result back over them.
+    //
+    // A zero original size also makes Rive's resetSize() actively harmful -
+    // it assigns width(0), height(0) - which is why execute() restores this
+    // snapshot instead of calling it.
+    mArtboardW = mArtboard->width();
+    mArtboardH = mArtboard->height();
+
     mPrevChopValues.clear();
     mPrevDatValues.clear();
     bindArtboardViewModel();
@@ -574,6 +765,7 @@ bool TDRiveTOP::selectSceneIfNeeded(const char* smC)
 void TDRiveTOP::bindArtboardViewModel()
 {
     mVMRuntime.reset();
+    mVmProps.clear();
     // A new VM runtime knows nothing about previously bound images.
     for (auto& p : mBoundSlotImage) p = nullptr;
     if (!mFile || !mArtboard) return;
@@ -584,6 +776,43 @@ void TDRiveTOP::bindArtboardViewModel()
     if (!runtime) return;
     mArtboard->bindViewModelInstance(runtime->instance());
     mVMRuntime = std::move(runtime);
+    rebuildVmProps();
+}
+
+// Walks the view model and every child view model, recording one entry per
+// property keyed by its full '/'-delimited path.
+//
+// The child runtimes returned by propertyViewModel() are cached inside the
+// parent runtime, so recursing here does not create anything that outlives
+// mVMRuntime.
+void TDRiveTOP::collectVmProps(rive::ViewModelInstanceRuntime* vm,
+                               const std::string& prefix, int depth)
+{
+    // A view model may legally contain a property of its own type, so this
+    // walk has to be bounded on both axes or a self-referencing file would
+    // recurse (or fan out) forever.
+    constexpr int    kMaxDepth = 8;
+    constexpr size_t kMaxProps = 2000;
+
+    if (!vm || depth > kMaxDepth || mVmProps.size() >= kMaxProps) return;
+
+    for (const auto& p : vm->properties()) {
+        if (mVmProps.size() >= kMaxProps) return;
+        std::string path = prefix.empty() ? p.name : prefix + "/" + p.name;
+        mVmProps.push_back({path, p.type});
+
+        if (p.type == rive::DataType::viewModel) {
+            if (auto child = vm->propertyViewModel(p.name)) {
+                collectVmProps(child.get(), path, depth + 1);
+            }
+        }
+    }
+}
+
+void TDRiveTOP::rebuildVmProps()
+{
+    mVmProps.clear();
+    if (mVMRuntime) collectVmProps(mVMRuntime.get(), std::string(), 0);
 }
 
 // =============================================================================
@@ -642,8 +871,13 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
     int32_t startRow = 0;
     if (dat->numRows > 0) {
         const char* c0 = dat->getCell(0, 0);
-        if (c0 && (!std::strcmp(c0, "name") || !std::strcmp(c0, "Name") ||
-                   !std::strcmp(c0, "key")  || !std::strcmp(c0, "Key"))) {
+        // "label" matters as much as "name" here: a Parameter DAT set to
+        // emit labels (which is how a control COMP hands us Rive paths, since
+        // TD par NAMES cannot contain '/') writes "label" into this cell.
+        // Without it the header row gets applied as a property called "label".
+        if (c0 && (!std::strcmp(c0, "name")  || !std::strcmp(c0, "Name")  ||
+                   !std::strcmp(c0, "key")   || !std::strcmp(c0, "Key")   ||
+                   !std::strcmp(c0, "label") || !std::strcmp(c0, "Label"))) {
             startRow = 1;
         }
     }
@@ -674,6 +908,72 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 bool changed = (pit == mPrevDatValues.end()) || (pit->second != value);
                 if (changed && dat_value_truthy(value)) tp->trigger();
                 handled = true;
+            } else if (auto* ep = mVMRuntime->propertyEnum(name)) {
+                // Rive ignores a value that isn't one of the enum's cases, so a
+                // typo just leaves the property where it was. The Info DAT's
+                // "options" column lists the accepted values.
+                if (ep->value() != value) ep->value(value);
+                handled = true;
+            } else if (auto* ap = mVMRuntime->propertyArtboard(name)) {
+                // An artboard property takes the NAME of an artboard in this
+                // file. An empty cell means "leave it alone" rather than
+                // "unbind" - these are usually authored with a default, and
+                // silently clearing one on a blank row would be a nasty
+                // surprise.
+                //
+                // artboardName() reads back through the bound asset, so this
+                // compare is what stops us building a fresh ArtboardInstance
+                // every single cook.
+                if (!value.empty() && mFile && ap->artboardName() != value) {
+                    if (auto bindable = mFile->bindableArtboardNamed(value)) {
+                        ap->value(std::move(bindable));
+                    }
+                }
+                handled = true;
+            }
+        }
+
+        // State-machine inputs. These have their own CHOP parameter, which
+        // stays the better path for ANIMATED numerics (no float->string->float
+        // round trip per frame) - but routing them here too means one
+        // Parameter DAT can drive a whole artboard, including older files that
+        // predate data binding.
+        if (!handled) {
+            if (auto* smi = currentSMI()) {
+                for (size_t i = 0; i < smi->inputCount(); ++i) {
+                    auto* in = smi->input(i);
+                    if (!in || in->name() != name) continue;
+                    switch (in->inputCoreType()) {
+                        case kInputTypeNumber: {
+                            auto* n = static_cast<rive::SMINumber*>(in);
+                            try {
+                                float v = std::stof(value);
+                                if (n->value() != v) n->value(v);
+                            } catch (...) {}
+                            break;
+                        }
+                        case kInputTypeBool: {
+                            auto* b = static_cast<rive::SMIBool*>(in);
+                            const bool nb = dat_value_truthy(value);
+                            if (b->value() != nb) b->value(nb);
+                            break;
+                        }
+                        case kInputTypeTrigger: {
+                            // Same edge rule as the CHOP path: fire when the
+                            // cell CHANGES to something truthy, so a constant
+                            // "1" fires once instead of every cook.
+                            auto pit = mPrevDatValues.find(name);
+                            const bool changed = (pit == mPrevDatValues.end()) ||
+                                                 (pit->second != value);
+                            if (changed && dat_value_truthy(value))
+                                static_cast<rive::SMITrigger*>(in)->fire();
+                            break;
+                        }
+                        default: break;
+                    }
+                    handled = true;
+                    break;
+                }
             }
         }
 
@@ -744,6 +1044,131 @@ void TDRiveTOP::applyImageInputsCPU(const OP_Inputs* inputs)
 }
 
 // =============================================================================
+// Output size and the align() content box
+// =============================================================================
+
+// The content AABB handed to Renderer::align().
+//
+// Rive's own Artboard::bounds() reports the *layout* box - layoutWidth() /
+// layoutHeight(), i.e. whatever Yoga computed - not the artboard frame the
+// designer drew in. For every .riv tested here Yoga collapses that box on the
+// horizontal axis (measured ~0-6 px wide against artboards more than a
+// thousand pixels tall), because the artboard carries a layout style whose
+// children are ordinary shapes rather than layout components, so "hug the
+// content" hugs nothing.
+//
+// Aligning against a zero-width box makes every Fit except None degenerate:
+// contain/cover/fill divide the frame width by ~0, so the artboard is scaled
+// into oblivion and the TOP comes out empty. That is the "Fit and Alignment
+// don't work" symptom - only Fit None + Alignment Top Left survives, because
+// that combination is the one that reduces to the identity transform and never
+// touches the content's width or height.
+//
+// So: align against the artboard's own frame, which is what the Fit and
+// Alignment menus are meant to describe. Fit::layout is the exception - that
+// mode exists precisely to hand the box to Rive's layout engine (and execute()
+// resizes the artboard to the render target for it), so there we use bounds().
+rive::AABB TDRiveTOP::artboardFrame(bool layoutFit) const
+{
+    const rive::AABB b = mArtboard->bounds();
+    if (layoutFit) return b;
+
+    const float w = mArtboardW;
+    const float h = mArtboardH;
+    if (w <= 0.0f || h <= 0.0f) return b;
+
+    // Preserve the artboard's origin offset (bounds() is offset by
+    // -layoutWidth * originX when the artboard doesn't use a frame origin) by
+    // carrying the ratio over to the authored size.
+    const float ox = (b.width()  > 0.0f) ? -b.left() / b.width()  : 0.0f;
+    const float oy = (b.height() > 0.0f) ? -b.top()  / b.height() : 0.0f;
+    return rive::AABB::fromLTWH(-w * ox, -h * oy, w, h);
+}
+
+// Output resolution, from the node's built-in Common page - the same Output
+// Resolution / Resolution parameters every other TOP has, rather than a custom
+// one duplicating them.
+//
+// Reading built-in parameters from a custom operator is quietly inconsistent,
+// so the two calls used here are the ones verified to work on this SDK:
+//
+//   getParString("outputresolution")     resolves
+//   getParInt2("resolution", &w, &h)     resolves (the tuplet's BASE name)
+//   getParInt("resolutionw") / ("...h")  does NOT - OP_Inputs raises
+//                                        "Cannot find parameter named"
+//
+// The menu arithmetic is done here rather than through TouchDesigner's own
+// TOP_Output::getSuggestedOutputDesc(), for two reasons. It is API v12 (TD 2025
+// series) and td_sdk/ vendors v11, so adopting it would stop this plugin
+// loading in TD 2023. And it would not help anyway: this TOP declares no TOP
+// inputs, so every input-relative mode comes back measured against a phantom
+// 127x127 input - asking for Half of a 460x140 artboard returned 63x63.
+//
+// With no input to inherit from, "Use Input" means the artboard's own size.
+// That is the right default for a .riv - a fresh node comes up at the size the
+// file was designed at, and Fit / Alignment then have nothing to do - and it is
+// also the base the scale and Fit/Limit options measure.
+//
+// Not supported: Use Global Res Multiplier (the C++ API exposes no way to read
+// the global multiplier) and Parent Panel Size (a plugin has no handle on the
+// panel hosting it); both fall back to the artboard size. Parent Panel Size
+// could be supported by moving td_sdk/ to the 2025 SDK and calling
+// getSuggestedOutputDesc() for that one mode.
+void TDRiveTOP::computeResolution(const OP_Inputs* inputs,
+                                  int32_t& outW, int32_t& outH) const
+{
+    double baseW = (double)kDefaultWidth;
+    double baseH = (double)kDefaultHeight;
+    if (mArtboard && mArtboardW > 0.0f && mArtboardH > 0.0f) {
+        baseW = (double)mArtboardW;
+        baseH = (double)mArtboardH;
+    }
+
+    const char* modeStr = inputs->getParString("outputresolution");
+    const std::string mode = modeStr ? modeStr : "useinput";
+
+    double parW = 0.0, parH = 0.0;
+    {
+        int32_t pw = 0, ph = 0;
+        if (inputs->getParInt2("resolution", pw, ph)) {
+            parW = (double)pw;
+            parH = (double)ph;
+        }
+    }
+
+    double w = baseW, h = baseH;
+    double mult = 0.0;
+    if      (mode == "eighth")  mult = 1.0 / 8.0;
+    else if (mode == "quarter") mult = 1.0 / 4.0;
+    else if (mode == "half")    mult = 1.0 / 2.0;
+    else if (mode == "2x")      mult = 2.0;
+    else if (mode == "4x")      mult = 4.0;
+    else if (mode == "8x")      mult = 8.0;
+
+    if (mult > 0.0) {
+        w = baseW * mult;
+        h = baseH * mult;
+    } else if (mode == "fit" || mode == "limit") {
+        if (parW > 0.0 && parH > 0.0) {
+            double sc = std::min(parW / baseW, parH / baseH);
+            if (mode == "limit") sc = std::min(sc, 1.0);   // Limit only shrinks
+            w = baseW * sc;
+            h = baseH * sc;
+        }
+    } else if (mode == "custom") {
+        if (parW > 0.0 && parH > 0.0) {
+            w = parW;
+            h = parH;
+        }
+    }
+    // "useinput", "parpanel", and anything unrecognised, keep the artboard
+    // size - see the note above on Parent Panel Size.
+
+    outW = std::clamp((int32_t)std::lround(w), 1, 32768);
+    outH = std::clamp((int32_t)std::lround(h), 1, 32768);
+}
+
+// =============================================================================
 // Execute
 // =============================================================================
 
@@ -758,18 +1183,6 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mBackendReady = true;
     }
 
-    int32_t resW = 0, resH = 0;
-    inputs->getParInt2("Resolution", resW, resH);
-    if (resW <= 0) resW = kDefaultWidth;
-    if (resH <= 0) resH = kDefaultHeight;
-    {
-        std::string err;
-        if (!mBackend->ensureRenderTarget((uint32_t)resW, (uint32_t)resH, err)) {
-            if (!err.empty()) setError(err);
-            return;
-        }
-    }
-
     const char* filePath = inputs->getParFilePath("File");
     const char* artboard = inputs->getParString("Artboard");
     const char* stateMch = inputs->getParString("Statemachine");
@@ -782,6 +1195,18 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     bool ok = loadFileIfNeeded(filePath);
     if (ok) ok = selectArtboardIfNeeded(artboard);
     if (ok) ok = selectSceneIfNeeded(stateMch);
+
+    // The output size can depend on the artboard (Use Input and the scale
+    // options are all measured from it), so the file has to be resolved first.
+    int32_t resW = 0, resH = 0;
+    computeResolution(inputs, resW, resH);
+    {
+        std::string err;
+        if (!mBackend->ensureRenderTarget((uint32_t)resW, (uint32_t)resH, err)) {
+            if (!err.empty()) setError(err);
+            return;
+        }
+    }
 
     if (ok && currentSMI()) {
         if (const auto* chop = inputs->getParCHOP("Inputs")) {
@@ -812,13 +1237,20 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 
     // In layout mode resize the artboard to the render target so Rive's internal
     // layout constraints (fill, etc.) apply to the actual output dimensions.
-    // In all other modes restore the artboard's intrinsic size from the .riv file.
+    // In all other modes restore the artboard's authored size.
+    //
+    // Restoring it is not optional: the layout pass inside advanceAndApply()
+    // overwrites width()/height() with what Yoga computed, so without this the
+    // artboard shrinks a little more every cook. We restore our own snapshot
+    // rather than calling Rive's resetSize(), which resets to originalWidth() /
+    // originalHeight() - zero for these files (see selectArtboardIfNeeded).
     if (ok && mArtboard) {
         if (FitFromIndex(fitIdx) == rive::Fit::layout) {
             mArtboard->width((float)resW);
             mArtboard->height((float)resH);
-        } else {
-            mArtboard->resetSize();
+        } else if (mArtboardW > 0.0f && mArtboardH > 0.0f) {
+            mArtboard->width(mArtboardW);
+            mArtboard->height(mArtboardH);
         }
     }
 
@@ -839,11 +1271,22 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 
     auto drawFn = [this, fitIdx, alignIdx, resW, resH](rive::Renderer* r) {
         if (!mArtboard) return;
+        const rive::Fit fit = FitFromIndex(fitIdx);
         r->save();
-        r->align(FitFromIndex(fitIdx),
+        if (gCUDAMode) {
+            // The CPU path tells TouchDesigner firstPixel = TopLeft, which is
+            // what makes our top-down D3D11 rows come out the right way up.
+            // TOP_CUDAOutputInfo has no equivalent field, so in CUDA mode TD
+            // reads the array bottom-up and the frame arrives upside down.
+            // Flip the scene about the middle of the render target instead -
+            // it is free, where flipping the texture afterwards is another
+            // full-surface copy.
+            r->transform(rive::Mat2D(1.0f, 0.0f, 0.0f, -1.0f, 0.0f, (float)resH));
+        }
+        r->align(fit,
                  AlignmentFromIndex(alignIdx),
                  rive::AABB(0, 0, (float)resW, (float)resH),
-                 mArtboard->bounds());
+                 artboardFrame(fit == rive::Fit::layout));
         mArtboard->draw(r);
         r->restore();
     };
@@ -939,6 +1382,308 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 }
 
 // =============================================================================
+// Python class on the node
+// =============================================================================
+//
+// TD builds a Python class for this operator out of customOPInfo.pythonGetSets,
+// so `op('rive1').<name>` reaches straight into the plugin. That is the only
+// way to hand the loaded .riv's property schema to Python: an OP_Inputs can
+// read a CHOP, a DAT or a TOP, but nothing lets it read a COMP's parameters,
+// and Python cannot read a custom OP's Info DAT without a real Info DAT
+// operator wired up.
+
+#if defined(TDRIVE_PYTHON)
+namespace {
+
+// Bumped whenever the emitted schema's shape changes, so a control COMP built
+// against an older plugin can notice and rebuild rather than silently
+// mis-mapping fields.
+constexpr const char* kTDRiveSchemaVersion = "1.0";
+
+// The PyObject TD hands a getter IS a PY_Struct, and its context can return
+// our C++ instance. A null result is legitimate rather than exceptional - a
+// script can hold the Python object after its node was deleted - and
+// getNodeInstance() has already set the Python error in that case, so callers
+// just propagate the null.
+TDRiveTOP* PyNodeInstance(PyObject* self, bool autoCook)
+{
+    auto* me = reinterpret_cast<PY_Struct*>(self);
+    PY_GetInfo info;
+    info.autoCook = autoCook;
+    return static_cast<TDRiveTOP*>(me->context->getNodeInstance(info));
+}
+
+PyObject* pyGetSchemaVersion(PyObject* self, void*)
+{
+    // A constant, so there is nothing to cook for - but we still resolve the
+    // instance, because that is what proves the node is still alive.
+    if (!PyNodeInstance(self, /*autoCook=*/false)) return nullptr;
+    return PyUnicode_FromString(kTDRiveSchemaVersion);
+}
+
+// PyDict_SetItemString does NOT steal a reference, so each value built here is
+// released whether or not the insert succeeded. Getting this wrong leaks on
+// every cook of every node - and a getter that leaks takes TouchDesigner down
+// with it, not just this operator.
+bool DictSetStr(PyObject* d, const char* key, const std::string& v)
+{
+    PyObject* o = PyUnicode_FromString(v.c_str());
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+bool DictSetLong(PyObject* d, const char* key, long v)
+{
+    PyObject* o = PyLong_FromLong(v);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+bool DictSetBool(PyObject* d, const char* key, bool v)
+{
+    PyObject* o = PyBool_FromLong(v ? 1 : 0);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+// Hands Python a real list rather than the Info DAT's comma-joined cell:
+// Rive enum values and artboard names can contain commas, so splitting the
+// joined form back apart downstream would be lossy.
+bool DictSetStrList(PyObject* d, const char* key,
+                    const std::vector<std::string>& vals)
+{
+    PyObject* list = PyList_New(0);
+    if (!list) return false;
+    for (const auto& s : vals) {
+        PyObject* o = PyUnicode_FromString(s.c_str());
+        if (!o) { Py_DECREF(list); return false; }
+        const bool appended = PyList_Append(list, o) == 0;
+        Py_DECREF(o);
+        if (!appended) { Py_DECREF(list); return false; }
+    }
+    const bool ok = PyDict_SetItemString(d, key, list) == 0;
+    Py_DECREF(list);
+    return ok;
+}
+
+PyObject* pyGetPropertySchema(PyObject* self, void*)
+{
+    // autoCook: the schema describes the loaded file/artboard, and a node that
+    // has never cooked has neither. Cook first so a fresh node reports its real
+    // surface rather than an empty list.
+    TDRiveTOP* inst = PyNodeInstance(self, /*autoCook=*/true);
+    if (!inst) return nullptr;
+
+    const std::vector<TDRiveTOP::SchemaEntry> schema = inst->propertySchema();
+
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+
+    long index = 0;
+    for (const auto& e : schema) {
+        PyObject* d = PyDict_New();
+        if (!d) { Py_DECREF(list); return nullptr; }
+
+        const bool ok =
+            DictSetLong(d, "index", index) &&
+            DictSetStr(d, "source", e.source) &&
+            DictSetStr(d, "path", e.path) &&
+            DictSetStr(d, "type", e.type) &&
+            DictSetStr(d, "value", e.value) &&
+            DictSetStrList(d, "options", e.options) &&
+            DictSetBool(d, "container", e.container);
+
+        if (!ok) { Py_DECREF(d); Py_DECREF(list); return nullptr; }
+
+        const bool appended = PyList_Append(list, d) == 0;
+        Py_DECREF(d);
+        if (!appended) { Py_DECREF(list); return nullptr; }
+        ++index;
+    }
+
+    return list;
+}
+
+bool DictSetDouble(PyObject* d, const char* key, double v)
+{
+    PyObject* o = PyFloat_FromDouble(v);
+    if (!o) return false;
+    const bool ok = PyDict_SetItemString(d, key, o) == 0;
+    Py_DECREF(o);
+    return ok;
+}
+
+// The TD parameter style a schema entry maps to, or nullptr when the entry
+// cannot be driven as a parameter.
+//
+// The list is deliberately narrower than the type list the schema reports: an
+// entry only earns a parameter if applyStringsFromDAT() can actually apply it.
+// vm:viewModel is a branch rather than a value; vm:list, vm:color, vm:image
+// and vm:font have no write path yet, and generating dead parameters for them
+// would look like support that isn't there.
+const char* ParStyleForType(const std::string& type, bool container)
+{
+    if (container) return nullptr;
+    if (type == "vm:string")   return "Str";
+    if (type == "vm:number")   return "Float";
+    if (type == "vm:integer")  return "Int";
+    if (type == "vm:bool")     return "Toggle";
+    if (type == "vm:trigger")  return "Pulse";
+    if (type == "vm:enum")     return "Menu";
+    if (type == "vm:artboard") return "Menu";
+    // State-machine inputs.
+    if (type == "number")      return "Float";
+    if (type == "bool")        return "Toggle";
+    if (type == "trigger")     return "Pulse";
+    return nullptr;
+}
+
+// TD parameter names must start with a capital letter and hold only letters
+// and digits, so a Rive path cannot be one. The LABEL carries the real path
+// instead - labels are unconstrained, which is what lets a Parameter DAT emit
+// the Rive path verbatim and feed it straight back into the Strings DAT. That
+// makes this name a handle and nothing more: being unique and stable matters,
+// being pretty does not.
+std::string ManglePath(const std::string& path)
+{
+    // Capital first character, everything after it lower case. That looks
+    // lossy next to a camelCase path, but it is exactly what TD enforces:
+    // addParametersFromJSONList() takes "CopyCTA" and silently stores
+    // "Copycta". Mangling to anything else would make the collision check
+    // below run on a namespace TD does not actually use, so two paths
+    // differing only in case would pass here and then clobber each other.
+    std::string out;
+    for (char c : path) {
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const bool digit = (c >= '0' && c <= '9');
+        if (!alpha && !digit) continue;   // '/', spaces and '-' just vanish
+        if (out.empty() && digit) out += 'P';   // may not START with a digit
+        out += out.empty() ? (char)std::toupper((unsigned char)c)
+                           : (char)std::tolower((unsigned char)c);
+    }
+    if (out.empty()) out = "P";
+    return out;
+}
+
+PyObject* pyGetTdJSONPars(PyObject* self, void*)
+{
+    TDRiveTOP* inst = PyNodeInstance(self, /*autoCook=*/true);
+    if (!inst) return nullptr;
+
+    const std::vector<TDRiveTOP::SchemaEntry> schema = inst->propertySchema();
+
+    PyObject* list = PyList_New(0);
+    if (!list) return nullptr;
+
+    // Mangling is lossy, so two different Rive paths can collide on one name.
+    // Collisions get a numeric suffix; order is stable because the schema walk
+    // is, which keeps names the same across rebuilds of the same file.
+    std::unordered_map<std::string, int> used;
+
+    for (const auto& e : schema) {
+        const char* style = ParStyleForType(e.type, e.container);
+        if (!style) continue;
+
+        std::string name = ManglePath(e.path);
+        const int seen = ++used[name];
+        if (seen > 1) name += std::to_string(seen);
+
+        PyObject* d = PyDict_New();
+        if (!d) { Py_DECREF(list); return nullptr; }
+
+        // Nested view models become their own parameter page: one flat page of
+        // 46 parameters is unusable, and the first path segment is already the
+        // grouping the Rive author chose.
+        const size_t slash = e.path.find('/');
+        const std::string page =
+            (slash == std::string::npos) ? std::string("Rive")
+                                         : e.path.substr(0, slash);
+
+        bool ok =
+            DictSetStr(d, "name", name) &&
+            // The whole point: the label is the Rive path, verbatim.
+            DictSetStr(d, "label", e.path) &&
+            DictSetStr(d, "page", page) &&
+            DictSetStr(d, "style", style) &&
+            DictSetLong(d, "size", 1) &&
+            DictSetBool(d, "enable", true) &&
+            DictSetBool(d, "readOnly", false) &&
+            DictSetBool(d, "startSection", false) &&
+            DictSetStr(d, "help", e.type + "  -  " + e.path) &&
+            // Carried through so a generator can route by origin without
+            // re-deriving it from the style.
+            DictSetStr(d, "riveSource", e.source) &&
+            DictSetStr(d, "rivePath", e.path) &&
+            DictSetStr(d, "riveType", e.type);
+
+        if (ok) {
+            const std::string s = style;
+            if (s == "Float" || s == "Int") {
+                double v = 0.0;
+                try { v = std::stod(e.value); } catch (...) { v = 0.0; }
+                ok = ok && (s == "Int" ? DictSetLong(d, "default", (long)v)
+                                       : DictSetDouble(d, "default", v));
+                // Rive publishes no range for a number property, so nothing
+                // here is authoritative: these are SLIDER HINTS only, and the
+                // clamps stay off so any value can still be typed in. 0..100
+                // covers the common Rive percentage case; anything outside it
+                // gets a range built around the value we actually found.
+                const double hi = (v > 100.0 || v < 0.0)
+                                      ? std::abs(v) * 2.0 : 100.0;
+                ok = ok && DictSetDouble(d, "normMin", 0.0)
+                        && DictSetDouble(d, "normMax", hi)
+                        && DictSetBool(d, "clampMin", false)
+                        && DictSetBool(d, "clampMax", false);
+            } else if (s == "Toggle") {
+                ok = ok && DictSetBool(d, "default", e.value == "1");
+            } else if (s == "Menu") {
+                ok = ok && DictSetStr(d, "default", e.value)
+                        && DictSetStrList(d, "menuNames", e.options)
+                        && DictSetStrList(d, "menuLabels", e.options);
+            } else if (s == "Pulse") {
+                // A pulse holds no value; "(pulse)" is display text from the
+                // Info DAT and must not leak into a default.
+                ok = ok && DictSetLong(d, "default", 0);
+            } else {
+                ok = ok && DictSetStr(d, "default", e.value);
+            }
+        }
+
+        if (!ok) { Py_DECREF(d); Py_DECREF(list); return nullptr; }
+
+        const bool appended = PyList_Append(list, d) == 0;
+        Py_DECREF(d);
+        if (!appended) { Py_DECREF(list); return nullptr; }
+    }
+
+    return list;
+}
+
+PyGetSetDef gPyGetSets[] = {
+    {"schemaVersion", pyGetSchemaVersion, nullptr,
+     "Version of the property-schema format this plugin emits.", nullptr},
+    {"propertySchema", pyGetPropertySchema, nullptr,
+     "List of dicts describing every addressable input on the loaded artboard: "
+     "index, source ('smi'/'vm'), path, type, value, options, container.",
+     nullptr},
+    {"tdJSONPars", pyGetTdJSONPars, nullptr,
+     "Parameter definitions in TDJSON form, one per addressable Rive property. "
+     "Each carries the Rive path in 'label' (TD labels are unconstrained) so a "
+     "Parameter DAT can emit it straight back into the node's Strings DAT.",
+     nullptr},
+    {nullptr, nullptr, nullptr, nullptr, nullptr},
+};
+
+} // namespace
+#endif // TDRIVE_PYTHON
+
+// =============================================================================
 // Plugin entry points
 // =============================================================================
 
@@ -954,13 +1699,12 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
 {
     info->apiVersion  = TD::TOPCPlusPlusAPIVersion;
 
-    // Prefer CUDA execute mode when the machine can do zero-copy texture
-    // sharing (Windows + an NVIDIA GPU whose adapter D3D11 can also use).
-    // Everything else - macOS, AMD/Intel GPUs, missing CUDA runtime - falls
-    // back to the CPUMem readback path.
+    // CPUMem everywhere by default; CUDA execute mode is opt-in behind
+    // TDRIVE_CUDA=1 because it costs every Rive TOP a CUDA bracket per cook,
+    // injecting or not. See cuda_interop_win.h.
     info->executeMode = TD::TOP_ExecuteMode::CPUMem;
 #if defined(_WIN32)
-    if (tdrive::cuda::AvailableForD3D11()) {
+    if (tdrive::cuda::EnabledByEnv() && tdrive::cuda::AvailableForD3D11()) {
         info->executeMode = TD::TOP_ExecuteMode::CUDA;
         gCUDAMode = true;
     }
@@ -971,9 +1715,24 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     custom.opLabel->setString("Rive");
     custom.opIcon->setString("RIV");
     custom.authorName->setString("Evan Clark");
-    custom.authorEmail->setString("you@example.com");
+    custom.authorEmail->setString("djevanclark@gmail.com");
+
+    // Bump the MINOR version only: TouchDesigner requires a project's saved
+    // major version to MATCH the installed plugin's, so raising major would
+    // stop every existing .toe containing a Rive node (major 0) from loading.
+    // Minor only has to be >= what the project was saved with.
+    custom.majorVersion = 0;
+    custom.minorVersion = 7;
+
     custom.minInputs = 0;
     custom.maxInputs = 0;
+
+#if defined(TDRIVE_PYTHON)
+    // Declaring the version is what lets this node hand CPython objects back
+    // to TD; pythonGetSets is what TD builds the node's Python class from.
+    custom.pythonVersion->setString(kTDRivePythonVersion);
+    custom.pythonGetSets = gPyGetSets;
+#endif
 }
 
 TD_VIS DLLEXPORT TD::TOP_CPlusPlusBase*

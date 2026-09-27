@@ -29,9 +29,25 @@ namespace tdrive {
 // parameter pairs on the node).
 constexpr int kMaxImageSlots = 4;
 
+// Per-cook timing breakdown of the readback path, in milliseconds, for the
+// last completed renderAndReadback(). Surfaced as Info CHOP channels so the
+// cost can be attributed without a profiler - the CPU round-trip dominates at
+// high resolutions and it matters which part of it.
+struct ReadbackTimings {
+    double renderMs = 0.0;   // beginFrame + draw + flush (GPU work submitted)
+    double copyMs   = 0.0;   // CopyResource GPU -> staging
+    double mapMs    = 0.0;   // Map(READ) - blocks until the GPU catches up
+    double memcpyMs = 0.0;   // staging -> TouchDesigner's buffer
+    double totalMs  = 0.0;
+};
+
 class IBackend {
 public:
     virtual ~IBackend() = default;
+
+    // Timings for the most recent renderAndReadback(). All zero on backends
+    // that don't instrument it.
+    virtual ReadbackTimings lastTimings() const { return {}; }
 
     // One-time setup. Returns false and fills 'err' on failure.
     virtual bool init(std::string& err) = 0;

@@ -4,3 +4,4 @@ DerivedData/
 third_party/rive-runtime/
 .DS_Store
 *.dSYM/
+__pycache__/

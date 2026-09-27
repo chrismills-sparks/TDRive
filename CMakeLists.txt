@@ -107,6 +107,177 @@ target_include_directories(TDRiveTOP PRIVATE
 
 target_link_libraries(TDRiveTOP PRIVATE ${RIVE_LIBS})
 
+# -----------------------------------------------------------------------------
+# CPython - the schema endpoint (pythonGetSets) exposed on the node.
+# -----------------------------------------------------------------------------
+# We build against the Python SDK TouchDesigner ships with itself, so there is
+# no external Python dependency. Two things matter here:
+#
+#   * Py_LIMITED_API + python3.lib = the PEP 384 stable ABI. That binds the
+#     plugin to python3.dll rather than python311.dll, so it is not hostage to
+#     a single CPython minor release. Everything the schema getter needs
+#     (PyGetSetDef, PyDict_*, PyUnicode_FromString, PyFloat_FromDouble,
+#     PyBool_FromLong, PyList_*) lives inside the limited API.
+#   * customOPInfo.pythonVersion is a separate, softer gate TD checks at load
+#     time - see kTDRivePythonVersion in TDRiveTOP.cpp.
+#
+# Point TD_PYTHON_ROOT at a Python SDK root to override the auto-discovery
+# below. Two root layouts are accepted, because CI has no TouchDesigner
+# install to borrow the SDK from:
+#
+#   TD's bundled SDK   <root>/Include/Python.h  + Include/PC/  + lib/x64/python3.lib
+#   a stock CPython    <root>/include/Python.h                 + libs/python3.lib
+#
+# The second is what actions/setup-python lays down, so CI points
+# TD_PYTHON_ROOT straight at $env:pythonLocation.
+#
+# Failing to resolve a root is FATAL, not a warning. A warning here still
+# emits a perfectly loadable plugin with the entire Python block compiled
+# out - no pythonGetSets, so TD builds no Python class on the node and
+# `op('rive1').propertySchema` raises AttributeError. That is exactly how a
+# schema-less DLL once got tagged and shipped: the CI runner has no
+# TouchDesigner, the glob below found nothing, and the build went green.
+# If you genuinely want the plugin without the endpoint, say so out loud
+# with -DTDRIVE_PYTHON=OFF.
+option(TDRIVE_PYTHON "Expose the Rive property schema through CPython" ON)
+
+if(TDRIVE_PYTHON AND WIN32)
+    if(NOT TD_PYTHON_ROOT)
+        file(GLOB _td_py_roots
+             "C:/Program Files/Derivative/TouchDesigner.*/Samples/CPlusPlus/3rdParty/Python")
+        if(_td_py_roots)
+            list(SORT _td_py_roots)
+            list(REVERSE _td_py_roots)          # newest install first
+            list(GET _td_py_roots 0 TD_PYTHON_ROOT)
+        endif()
+    endif()
+
+    # Resolve headers and import library separately: the two layouts agree on
+    # neither directory name, and python3.lib is the gate that actually
+    # decides whether this links.
+    set(_tdrive_py_inc "")
+    set(_tdrive_py_lib "")
+    if(TD_PYTHON_ROOT)
+        foreach(_cand "Include" "include")
+            if(EXISTS "${TD_PYTHON_ROOT}/${_cand}/Python.h")
+                set(_tdrive_py_inc "${TD_PYTHON_ROOT}/${_cand}")
+                break()
+            endif()
+        endforeach()
+        foreach(_cand "lib/x64" "libs")
+            if(EXISTS "${TD_PYTHON_ROOT}/${_cand}/python3.lib")
+                set(_tdrive_py_lib "${TD_PYTHON_ROOT}/${_cand}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(_tdrive_py_inc AND _tdrive_py_lib)
+        message(STATUS "TDRive: CPython schema endpoint ON")
+        message(STATUS "TDRive:   headers     ${_tdrive_py_inc}")
+        message(STATUS "TDRive:   python3.lib ${_tdrive_py_lib}")
+        target_include_directories(TDRiveTOP PRIVATE "${_tdrive_py_inc}")
+        # TD's SDK keeps the Windows pyconfig.h under Include/PC (it ships the
+        # CPython source tree's layout); an installed CPython has it beside
+        # Python.h and has no PC directory at all.
+        if(EXISTS "${_tdrive_py_inc}/PC/pyconfig.h")
+            target_include_directories(TDRiveTOP PRIVATE "${_tdrive_py_inc}/PC")
+        endif()
+        # pyconfig.h emits `#pragma comment(lib, "python3.lib")` once
+        # Py_LIMITED_API is defined, so the search path above is all the linker
+        # needs - naming the lib again here would be redundant.
+        target_link_directories(TDRiveTOP PRIVATE "${_tdrive_py_lib}")
+        target_compile_definitions(TDRiveTOP PRIVATE
+            TDRIVE_PYTHON
+            Py_LIMITED_API=0x030B0000   # 3.11, the floor TD 2023+ ships
+        )
+    else()
+        set(_tdrive_py_why "no TD_PYTHON_ROOT could be found")
+        if(TD_PYTHON_ROOT)
+            set(_tdrive_py_why "TD_PYTHON_ROOT=${TD_PYTHON_ROOT} is missing")
+            if(NOT _tdrive_py_inc)
+                string(APPEND _tdrive_py_why " Include/Python.h (or include/Python.h)")
+            endif()
+            if(NOT _tdrive_py_lib)
+                if(NOT _tdrive_py_inc)
+                    string(APPEND _tdrive_py_why " and")
+                endif()
+                string(APPEND _tdrive_py_why " lib/x64/python3.lib (or libs/python3.lib)")
+            endif()
+        endif()
+        message(FATAL_ERROR
+            "TDRIVE_PYTHON is ON but no usable Python SDK was found: "
+            "${_tdrive_py_why}.\n"
+            "Searched for a TouchDesigner install at "
+            "C:/Program Files/Derivative/TouchDesigner.*/Samples/CPlusPlus/3rdParty/Python.\n"
+            "Fix by pointing -DTD_PYTHON_ROOT=<path> at either a TD Python SDK "
+            "or a stock CPython 3.11 install, or build without the schema "
+            "endpoint on purpose with -DTDRIVE_PYTHON=OFF.\n"
+            "This is fatal by design - see the comment above. A silent "
+            "downgrade here ships a plugin whose Python attributes are simply "
+            "absent, which is indistinguishable from a broken install.")
+    endif()
+elseif(TDRIVE_PYTHON AND APPLE)
+    # macOS needs headers only. TD bundles CPython as an @rpath Python.framework
+    # and each TD build ships a different 3.11.x, so rather than link one, the
+    # Python symbols are left undefined and bound at load time to the
+    # interpreter TD already has loaded.
+    #
+    # Each allowed symbol is named with -U rather than using a blanket
+    # -undefined dynamic_lookup: that would hide a genuinely missing Rive or
+    # system symbol until TD loads the plugin, and older ld (macos-14 runner)
+    # also stops binding _objc_msgSend to libobjc under it. If you call a new
+    # CPython function, the link fails naming it - add it to this list.
+    # scripts/verify_python_endpoint.py re-checks the artifact.
+    #
+    # Accepted roots (TD_PYTHON_ROOT overrides the auto-discovery):
+    #   TD's bundle     .../Python.framework/Versions/3.11  (include/python3.11/)
+    #   a stock CPython <root>/include/python3.11/Python.h  (actions/setup-python)
+    if(NOT TD_PYTHON_ROOT)
+        file(GLOB _td_py_roots
+             "/Applications/TouchDesigner*.app/Contents/Frameworks/Python.framework/Versions/3.11")
+        if(_td_py_roots)
+            list(GET _td_py_roots 0 TD_PYTHON_ROOT)
+        endif()
+    endif()
+
+    set(_tdrive_py_inc "")
+    if(TD_PYTHON_ROOT)
+        foreach(_cand "include/python3.11" "Headers" "include")
+            if(EXISTS "${TD_PYTHON_ROOT}/${_cand}/Python.h")
+                set(_tdrive_py_inc "${TD_PYTHON_ROOT}/${_cand}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(_tdrive_py_inc)
+        message(STATUS "TDRive: CPython schema endpoint ON")
+        message(STATUS "TDRive:   headers ${_tdrive_py_inc}")
+        target_include_directories(TDRiveTOP PRIVATE "${_tdrive_py_inc}")
+        set(_tdrive_py_symbols
+            PyBool_FromLong PyDict_New PyDict_SetItemString PyFloat_FromDouble
+            PyList_Append PyList_New PyLong_FromLong PyUnicode_FromString
+            _Py_Dealloc)
+        foreach(_sym IN LISTS _tdrive_py_symbols)
+            target_link_options(TDRiveTOP PRIVATE "LINKER:-U,_${_sym}")
+        endforeach()
+        target_compile_definitions(TDRiveTOP PRIVATE
+            TDRIVE_PYTHON
+            Py_LIMITED_API=0x030B0000
+        )
+    else()
+        message(FATAL_ERROR
+            "TDRIVE_PYTHON is ON but no Python 3.11 headers were found "
+            "(TD_PYTHON_ROOT=${TD_PYTHON_ROOT}).\n"
+            "Searched /Applications/TouchDesigner*.app/Contents/Frameworks/"
+            "Python.framework/Versions/3.11.\n"
+            "Fix by pointing -DTD_PYTHON_ROOT=<path> at a TD Python.framework "
+            "version dir or a stock CPython 3.11 install, or build without the "
+            "schema endpoint on purpose with -DTDRIVE_PYTHON=OFF.")
+    endif()
+endif()
+
 # The Rive static libs are built with RTTI disabled (they use an internal
 # "lite rtti" scheme). Any rive-derived class we instantiate in plugin TUs
 # (e.g. RiveRenderImage) would otherwise emit typeinfo references to symbols

@@ -35,9 +35,36 @@ public:
     void pulsePressed(const char* name, void*) override;
     void getErrorString(TD::OP_String* error, void*) override;
     void buildDynamicMenu(const TD::OP_Inputs*, TD::OP_BuildDynamicMenuInfo*, void*) override;
+    int32_t getNumInfoCHOPChans(void*) override;
+    void getInfoCHOPChan(int32_t index, TD::OP_InfoCHOPChan* chan, void*) override;
     bool getInfoDATSize(TD::OP_InfoDATSize*, void*) override;
     void getInfoDATEntries(int32_t index, int32_t nEntries,
                            TD::OP_InfoDATEntries* entries, void*) override;
+
+    // One addressable input on the loaded artboard.
+    //
+    // Rive's input surface comes in two generations and this flattens both
+    // into one list: state-machine inputs first (the original API - flat,
+    // number/bool/trigger only), then the view-model tree (data binding -
+    // nested, many types, addressed by '/'-delimited path).
+    //
+    // This is the single source of truth behind BOTH the Info DAT and the
+    // node's Python `propertySchema`. They must not format values
+    // independently: the two halves used to be walked separately, which is
+    // how the Info DAT's index column ended up restarting at 0 partway down
+    // the table.
+    struct SchemaEntry {
+        std::string source;    // "smi" | "vm"
+        std::string path;      // "Hover", or "payoffCard/barGraph1Label"
+        std::string type;      // "number"/"bool"/"trigger", or "vm:string"/...
+        std::string value;     // current value, stringified
+        std::vector<std::string> options;  // closed-set values; else empty
+        bool container = false;            // vm:viewModel - branch, not a leaf
+    };
+
+    // Walks the live state, so it is not const and not cheap - call it once
+    // per cook, not per row.
+    std::vector<SchemaEntry> propertySchema();
 
 private:
     bool loadFileIfNeeded(const char* absPath);
@@ -46,6 +73,31 @@ private:
     void applyInputsFromCHOP(const TD::OP_CHOPInput* chop);
     void applyStringsFromDAT(const TD::OP_DATInput* dat);
     void bindArtboardViewModel();
+
+    // Output size from the node's built-in Common page (no custom Resolution
+    // parameter), and the content box handed to Renderer::align(). Both need
+    // the artboard, so both run after the file/artboard are resolved.
+    void computeResolution(const TD::OP_Inputs* inputs,
+                           int32_t& outW, int32_t& outH) const;
+    rive::AABB artboardFrame(bool layoutFit) const;
+
+    // Flattened view-model property tree, rebuilt whenever the view model is
+    // (re)bound. A view model can hold child view models, so the Info DAT
+    // reports one row per property at every depth, addressed by the same
+    // '/'-delimited path Rive's own runtime accessors take - e.g.
+    // "payoffCard/title". That path is what the Strings DAT writes to.
+    struct VmProp {
+        std::string    path;
+        rive::DataType type;
+    };
+    std::vector<VmProp> mVmProps;
+    // Rebuilt in getInfoDATSize() and walked by getInfoDATEntries(). TD asks
+    // for the size before it walks the rows, so one rebuild covers the table.
+    std::vector<SchemaEntry> mSchemaCache;
+    void rebuildVmProps();
+    void collectVmProps(rive::ViewModelInstanceRuntime* vm,
+                        const std::string& prefix, int depth);
+
     // Texture injection (Image1..N params -> view-model image properties).
     // CPU download path; used on macOS and as the Windows non-CUDA fallback.
     void applyImageInputsCPU(const TD::OP_Inputs* inputs);
@@ -65,6 +117,12 @@ private:
     std::unique_ptr<rive::Scene>                mScene;
     rive::StateMachineInstance*                 mSMI = nullptr;  // non-owning
     rive::rcp<rive::ViewModelInstanceRuntime>   mVMRuntime;
+
+    // The artboard's authored frame, snapshotted when the instance is created.
+    // See selectArtboardIfNeeded() for why Rive's own originalWidth() and
+    // resetSize() cannot be used for this.
+    float mArtboardW = 0.0f;
+    float mArtboardH = 0.0f;
 
     std::string mLoadedPath;
     std::string mLoadedArtboard;
