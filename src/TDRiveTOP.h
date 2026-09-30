@@ -71,6 +71,7 @@ private:
     bool loadFileIfNeeded(const char* absPath);
     // Destroys the loaded file and everything built from it, dependents first.
     void releaseFile();
+    void releaseArtboard();
     bool selectArtboardIfNeeded(const char* name);
     bool selectSceneIfNeeded(const char* stateMachineName);
     void applyInputsFromCHOP(const TD::OP_CHOPInput* chop);
@@ -130,6 +131,10 @@ private:
     std::string mLoadedPath;
     std::string mLoadedArtboard;
     std::string mLoadedStateMachine;
+    // An artboard refused by findBrokenNestedAnimation(). A flag as well as a
+    // name, because "" is itself a valid name (the default artboard).
+    bool        mArtboardRejected = false;
+    std::string mRejectedArtboard;
 
     // Playback timing
     std::chrono::steady_clock::time_point mLastTick;
