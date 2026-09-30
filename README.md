@@ -199,11 +199,19 @@ two-column table the Strings DAT parameter already consumes.
 **Using the component:** drop `RiveControl.tox` into your project, set its
 **Rive TOP** parameter, and pulse **Build**. It generates one parameter per
 addressable property (grouped onto a page per nested view model) and points
-that TOP's Strings DAT at its own output. Build is get-or-create, so
-re-running it after changing artboard or file adds and updates parameters
-without disturbing values you have already set. **Clear** removes the
-generated parameters — separate from Build precisely because it discards
-their values, expressions and exports.
+that TOP's Strings DAT at its own output by a relative path, so the reference
+stays correct when the enclosing component is cloned or moved. Build is
+get-or-create, so re-running it after changing artboard or file adds and
+updates parameters without disturbing values you have already set.
+
+Expressions and binds on generated parameters are safe to rely on. Build and
+Clear record them in the component's storage, keyed by Rive property path, and
+Build re-applies them to any parameter it has to recreate for the exact same
+path. Setting a parameter back to constant mode forgets its record.
+
+**Clear** removes the generated parameters — separate from Build precisely
+because it discards their values and exports (expressions and binds come back
+on the next Build).
 
 Properties with no write path (`vm:viewModel` containers, `vm:list`,
 `vm:color`, `vm:image`, `vm:font`) are deliberately skipped rather than
