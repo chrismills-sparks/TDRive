@@ -164,16 +164,19 @@ private:
         // Mask page: a mask change has to re-render as much as the colour.
         int32_t     maskOn = -1, maskMode = -1;
         double      maskRes = -1.0;
+        bool        loaded   = false;
         bool sameAs(const RenderKey& o) const
         {
             return w == o.w && h == o.h && fit == o.fit && align == o.align &&
                    bg[0] == o.bg[0] && bg[1] == o.bg[1] && bg[2] == o.bg[2] &&
                    bg[3] == o.bg[3] && artboard == o.artboard && scene == o.scene &&
                    maskOn == o.maskOn && maskMode == o.maskMode &&
-                   maskRes == o.maskRes;
+                   maskRes == o.maskRes && loaded == o.loaded;
         }
     };
     RenderKey mLastRenderKey;
+    // absFrame of the last execute(), for spotting cooks TouchDesigner skipped.
+    int64_t mLastCookFrame = -1;
     // Cooks still to render. A change sets it to 2, not 1: the CPU readback
     // hands TouchDesigner the PREVIOUS cook's frame (double-buffered staging),
     // so the cook after the last change has to render once more to deliver it.

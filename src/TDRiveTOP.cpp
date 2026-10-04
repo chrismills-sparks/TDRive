@@ -1340,8 +1340,13 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mBackendReady = true;
     }
 
-    const char* filePath = inputs->getParFilePath("File");
-    const char* fileRaw  = inputs->getParString("File");
+    // A string from getParFilePath()/getParString() is only guaranteed until
+    // the same parameter is read again (CPlusPlus_Common.hpp), and both read
+    // "File" - so each is copied before the next read.
+    const char* filePathC = inputs->getParFilePath("File");
+    const std::string filePath = filePathC ? filePathC : "";
+    const char* fileRawC = inputs->getParString("File");
+    const std::string fileRaw = fileRawC ? fileRawC : "";
     const char* artboard = inputs->getParString("Artboard");
     const char* stateMch = inputs->getParString("Statemachine");
     int fitIdx   = inputs->getParInt("Fit");
@@ -1358,16 +1363,39 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     mWantTracked = maskOn;
     if (!maskOn) mBackend->releaseMaskTarget();
 
-    bool ok = loadFileIfNeeded(filePath);
+    bool ok = loadFileIfNeeded(filePath.c_str());
     // An empty resolved path is otherwise completely silent - no error, no
     // file, and a blank default-sized frame. When the parameter itself is set,
     // that is a failure worth reporting.
-    if (!ok && (!filePath || !*filePath) && fileRaw && *fileRaw) {
-        setError(std::string("File parameter '") + fileRaw +
-                 "' resolved to an empty path.");
+    //
+    // TouchDesigner resolves a path that does not exist to "". It also does
+    // so for a CLONE whose clone master had Allow Cooking turned off and back
+    // on: from then on the clone reads every custom number as 0 and every
+    // file path as "", while Python still shows the right values (TD
+    // 2025.33230; only re-cloning or a restart recovers it). A raw path that
+    // opens from here tells the two cases apart.
+    // No file set at all is not an error; drop one left from an earlier file.
+    if (!ok && fileRaw.empty()) clearError();
+    if (!ok && filePath.empty() && !fileRaw.empty()) {
+        if (std::ifstream(fileRaw, std::ios::binary).good()) {
+            setError("File '" + fileRaw + "' exists, but TouchDesigner "
+                     "returns this node's parameters as empty. On a clone this "
+                     "follows turning the clone master's Allow Cooking off and "
+                     "on - turn Enable Cloning off and on for this clone, or "
+                     "restart TouchDesigner.");
+        } else {
+            setError("File parameter '" + fileRaw + "' resolved to an empty path.");
+        }
     }
     if (ok) ok = selectArtboardIfNeeded(artboard);
     if (ok) ok = selectSceneIfNeeded(stateMch);
+
+    // A node in error shows TouchDesigner's error frame whatever it uploads,
+    // so rendering one would only burn a render and readback every cook.
+    if (!ok && !mError.empty()) {
+        mRendered = false;
+        return;
+    }
 
     // The output size can depend on the artboard (Use Input and the scale
     // options are all measured from it), so the file has to be resolved first.
@@ -1441,10 +1469,20 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
 
     // ---- Skip Idle Frames ------------------------------------------------
     // Render when the scene changed, an input pushed a value, anything
-    // outside Rive that shapes the frame moved, or there is nothing loaded
-    // (an unloaded node renders its cleared frame like before). Injected
-    // textures always render: Rive cannot see a TOP's pixels change.
+    // outside Rive that shapes the frame moved, or the node was not cooked
+    // for a while. Injected textures always render: Rive cannot see a TOP's
+    // pixels change. A node with nothing loaded (and no error) renders its
+    // cleared frame once, then idles like a settled one.
     {
+        // TouchDesigner drops a TOP's texture while it is not cooked - with
+        // Allow Cooking off on a parent COMP, for one - so a cook that skips
+        // after a gap would leave it blank. More than a few missed frames
+        // forces a render; a single dropped frame does not.
+        const OP_TimeInfo* ti = inputs->getTimeInfo();
+        const int64_t absFrame = ti ? ti->absFrame : -1;
+        const bool cookGap = mLastCookFrame >= 0 && absFrame > mLastCookFrame + 4;
+        mLastCookFrame = absFrame;
+
         RenderKey key;
         key.w = resW;  key.h = resH;  key.fit = fitIdx;  key.align = alignIdx;
         for (int i = 0; i < 4; ++i) key.bg[i] = bg[i];
@@ -1453,6 +1491,7 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         key.maskOn   = maskOn ? 1 : 0;
         key.maskMode = maskMode == tdrive::MaskMode::Alpha ? 1 : 0;
         key.maskRes  = maskRes;
+        key.loaded   = ok;
 
         bool imageInputs = false;
         for (int slot = 0; slot < tdrive::kMaxImageSlots && !imageInputs; ++slot) {
@@ -1461,7 +1500,7 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
             imageInputs = inputs->getParTOP(parName) != nullptr;
         }
 
-        if (!skipIdle || !ok || sceneChanged || mInputsChanged || imageInputs ||
+        if (!skipIdle || cookGap || sceneChanged || mInputsChanged || imageInputs ||
             !key.sameAs(mLastRenderKey)) {
             mRenderFramesLeft = 2;
         }
