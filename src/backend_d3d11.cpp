@@ -49,7 +49,8 @@ public:
 
     ~D3D11Backend() override
     {
-        unregisterTargetCUDA();
+        releaseSurface(mMain);
+        releaseSurface(mMask);
         for (auto& s : mSlots) releaseSlot(s);
         if (mStream) {
             if (const auto* api = cuda::Get()) api->streamDestroy(mStream);
@@ -59,11 +60,6 @@ public:
             mRenderContext->releaseResources();
             mRenderContext.reset();
         }
-        mRenderTarget.reset();
-        mTarget.Reset();
-        mStaging[0].Reset();
-        mStaging[1].Reset();
-        mStagingPending = false;
         mContext.Reset();
         mDevice.Reset();
     }
@@ -164,84 +160,18 @@ public:
 
     bool ensureRenderTarget(uint32_t w, uint32_t h, std::string& err) override
     {
-        if (w == 0 || h == 0) { err = "Render target has zero size."; return false; }
-        if (mTarget && mW == w && mH == h && mRenderTarget &&
-            (mCUDAMode ? mTargetCudaRes != nullptr : mStaging[0] != nullptr))
-            return true;
+        return ensureSurface(mMain, w, h, err);
+    }
 
-        unregisterTargetCUDA();
+    bool ensureMaskTarget(uint32_t w, uint32_t h, std::string& err) override
+    {
+        return ensureSurface(mMask, w, h, err);
+    }
 
-        // Offscreen texture, render-target + UAV (Rive renders via UAV in
-        // atomic mode, RTV in raster-ordered mode; we enable both so it
-        // works regardless of the path the Rive runtime picks).
-        D3D11_TEXTURE2D_DESC d{};
-        d.Width            = w;
-        d.Height           = h;
-        d.MipLevels        = 1;
-        d.ArraySize        = 1;
-        d.Format           = mTargetFormat;
-        d.SampleDesc.Count = 1;
-        d.Usage            = D3D11_USAGE_DEFAULT;
-        d.BindFlags        = D3D11_BIND_RENDER_TARGET |
-                             D3D11_BIND_SHADER_RESOURCE |
-                             D3D11_BIND_UNORDERED_ACCESS;
-        d.CPUAccessFlags   = 0;
-        d.MiscFlags        = 0;
-
-        mTarget.Reset();
-        HRESULT hr = mDevice->CreateTexture2D(&d, nullptr,
-                                              mTarget.ReleaseAndGetAddressOf());
-        if (FAILED(hr) || !mTarget) {
-            err = "Failed to allocate offscreen D3D11 texture.";
-            return false;
-        }
-
-        if (mCUDAMode) {
-            const auto* api = cuda::Get();
-            if (!api) { err = "CUDA runtime not loaded."; return false; }
-            cudaError_t ce = api->graphicsD3D11RegisterResource(
-                &mTargetCudaRes, mTarget.Get(),
-                cuda::kGraphicsRegisterFlagsNone);
-            if (ce != cuda::kSuccess) {
-                err = std::string("cudaGraphicsD3D11RegisterResource(target) "
-                                  "failed: ") + api->getErrorString(ce);
-                mTargetCudaRes = nullptr;
-                return false;
-            }
-        } else {
-            // Staging texture: CPU-readable copy destination.
-            D3D11_TEXTURE2D_DESC s{};
-            s.Width            = w;
-            s.Height           = h;
-            s.MipLevels        = 1;
-            s.ArraySize        = 1;
-            s.Format           = mTargetFormat;
-            s.SampleDesc.Count = 1;
-            s.Usage            = D3D11_USAGE_STAGING;
-            s.BindFlags        = 0;
-            s.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
-            s.MiscFlags        = 0;
-
-            for (int i = 0; i < 2; ++i) {
-                mStaging[i].Reset();
-                hr = mDevice->CreateTexture2D(
-                    &s, nullptr, mStaging[i].ReleaseAndGetAddressOf());
-                if (FAILED(hr) || !mStaging[i]) {
-                    err = "Failed to allocate D3D11 staging texture.";
-                    return false;
-                }
-            }
-            // Nothing has been copied into either one at the new size yet, so
-            // the next readback has to be the synchronous kind.
-            mStagingIdx     = 0;
-            mStagingPending = false;
-        }
-
-        auto* impl = mRenderContext->static_impl_cast<rive::gpu::RenderContextD3DImpl>();
-        mRenderTarget = impl->makeRenderTarget(w, h);
-        mW = w;
-        mH = h;
-        return true;
+    void releaseMaskTarget() override
+    {
+        releaseSurface(mMask);
+        mTimings.maskMs = 0.0;
     }
 
     using Clock = std::chrono::steady_clock;
@@ -252,75 +182,19 @@ public:
                            void*                                            dst,
                            std::string&                                     err) override
     {
-        if (!mRenderContext || !mRenderTarget || !mTarget || !mStaging[0]) {
-            err = "D3D11 backend not initialized.";
-            return false;
-        }
+        return surfaceRenderAndReadback(mMain, fd, draw, dst, err, /*main=*/true);
+    }
 
+    bool renderMaskAndReadback(const rive::gpu::RenderContext::FrameDescriptor& fd,
+                               const std::function<void(rive::Renderer*)>&      draw,
+                               void* dst, std::string& err) override
+    {
         const auto t0 = Clock::now();
-        renderFrame(fd, draw);
-        const auto t1 = Clock::now();
-
-        // Queue the GPU->staging copy for the frame we just drew.
-        //
-        // The two staging textures are used round-robin so that the Map()
-        // below reads the copy queued on the PREVIOUS cook, which the GPU has
-        // had a whole frame to retire. Mapping the copy we just queued is what
-        // made this expensive: Map(D3D11_MAP_READ) blocks until the GPU
-        // catches up, and that stall measured 2.17 ms of a 3.39 ms readback at
-        // 3840x2160 - 64% of it, against 0.08 ms of actual Rive rendering.
-        //
-        // The cost is one frame of latency: the texture handed to
-        // TouchDesigner is the frame drawn on the previous cook. The first
-        // cook after a resize has no previous copy to read, so it falls back
-        // to the synchronous path rather than emitting a blank frame.
-        const int cur  = mStagingIdx;
-        const int prev = mStagingIdx ^ 1;
-        mContext->CopyResource(mStaging[cur].Get(), mTarget.Get());
-        // Submit now instead of letting D3D11 batch. Without this the copy sits
-        // in the command buffer until something forces a flush - which is the
-        // Map() below - so the GPU only starts the copy at the moment we begin
-        // waiting for it, and double buffering buys nothing. Flushing here is
-        // what actually gives the GPU a whole frame to retire the copy.
-        mContext->Flush();
-        const auto t2 = Clock::now();
-
-        const int readIdx = mStagingPending ? prev : cur;
-
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT hr = mContext->Map(mStaging[readIdx].Get(), 0,
-                                   D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) { err = "Map(staging) failed."; return false; }
-        const auto t3 = Clock::now();
-
-        const uint8_t* src = (const uint8_t*)mapped.pData;
-        uint8_t*       d   = (uint8_t*)dst;
-        const size_t   rowBytes = (size_t)mW * 4;
-        if (mapped.RowPitch == rowBytes) {
-            // Tightly packed - one memcpy instead of a call per scanline.
-            std::memcpy(d, src, rowBytes * mH);
-        } else {
-            for (uint32_t y = 0; y < mH; ++y) {
-                std::memcpy(d + y * rowBytes,
-                            src + (size_t)y * mapped.RowPitch,
-                            rowBytes);
-            }
-        }
-        mContext->Unmap(mStaging[readIdx].Get(), 0);
-        const auto t4 = Clock::now();
-
-        mStagingIdx     = prev;
-        mStagingPending = true;
-
-        auto ms = [](Clock::time_point a, Clock::time_point b) {
-            return std::chrono::duration<double, std::milli>(b - a).count();
-        };
-        mTimings.renderMs = ms(t0, t1);
-        mTimings.copyMs   = ms(t1, t2);
-        mTimings.mapMs    = ms(t2, t3);
-        mTimings.memcpyMs = ms(t3, t4);
-        mTimings.totalMs  = ms(t0, t4);
-        return true;
+        const bool ok = surfaceRenderAndReadback(mMask, fd, draw, dst, err,
+                                                 /*main=*/false);
+        mTimings.maskMs = std::chrono::duration<double, std::milli>(
+                              Clock::now() - t0).count();
+        return ok;
     }
 
     tdrive::ReadbackTimings lastTimings() const override { return mTimings; }
@@ -329,54 +203,20 @@ public:
                       const std::function<void(rive::Renderer*)>&      draw,
                       void* dstCudaArray, std::string& err) override
     {
-        const auto* api = cuda::Get();
-        if (!mCUDAMode || !api) { err = "CUDA interop inactive."; return false; }
-        if (!mRenderContext || !mRenderTarget || !mTarget || !mTargetCudaRes) {
-            err = "D3D11 backend not initialized (CUDA).";
-            return false;
-        }
+        return surfaceRenderToCUDA(mMain, fd, draw, dstCudaArray, err,
+                                   /*main=*/true);
+    }
 
+    bool renderMaskToCUDA(const rive::gpu::RenderContext::FrameDescriptor& fd,
+                          const std::function<void(rive::Renderer*)>&      draw,
+                          void* dstCudaArray, std::string& err) override
+    {
         const auto t0 = Clock::now();
-        renderFrame(fd, draw);
-        // Make sure the D3D work is submitted before CUDA touches the
-        // texture. cudaGraphicsMapResources synchronizes with the device,
-        // but only against submitted work.
-        mContext->Flush();
-        const auto t1 = Clock::now();
-
-        cudaError_t ce = api->graphicsMapResources(1, &mTargetCudaRes, mStream);
-        if (ce != cuda::kSuccess) {
-            err = std::string("cudaGraphicsMapResources(target) failed: ") +
-                  api->getErrorString(ce);
-            return false;
-        }
-        const auto t2 = Clock::now();
-        cudaArray* srcArray = nullptr;
-        ce = api->graphicsSubResourceGetMappedArray(&srcArray,
-                                                    mTargetCudaRes, 0, 0);
-        if (ce == cuda::kSuccess && srcArray) {
-            ce = copyArray(api, (cudaArray*)dstCudaArray, srcArray, mW, mH);
-        }
-        const auto t3 = Clock::now();
-        api->graphicsUnmapResources(1, &mTargetCudaRes, mStream);
-        const auto t4 = Clock::now();
-
-        auto ms = [](Clock::time_point a, Clock::time_point b) {
-            return std::chrono::duration<double, std::milli>(b - a).count();
-        };
-        mTimings.renderMs = ms(t0, t1);
-        mTimings.mapMs    = ms(t1, t2);
-        mTimings.copyMs   = ms(t2, t3);
-        mTimings.unmapMs  = ms(t3, t4);
-        mTimings.memcpyMs = 0.0;
-        mTimings.totalMs  = ms(t0, t4);
-
-        if (ce != cuda::kSuccess) {
-            err = std::string("CUDA target copy failed: ") +
-                  api->getErrorString(ce);
-            return false;
-        }
-        return true;
+        const bool ok = surfaceRenderToCUDA(mMask, fd, draw, dstCudaArray, err,
+                                            /*main=*/false);
+        mTimings.maskMs = std::chrono::duration<double, std::milli>(
+                              Clock::now() - t0).count();
+        return ok;
     }
 
     rive::rcp<rive::RenderImage> updateImageSlot(
@@ -472,32 +312,282 @@ private:
         cudaGraphicsResource_t        cudaRes = nullptr;
     };
 
-    void renderFrame(const rive::gpu::RenderContext::FrameDescriptor& fd,
-                     const std::function<void(rive::Renderer*)>&      draw)
+    // One offscreen render target plus what it takes to get its pixels out:
+    // two staging textures (CPU path) or a CUDA registration (CUDA path). The
+    // main output and the mask output are one each, on the same device and
+    // render context.
+    struct Surface {
+        ComPtr<ID3D11Texture2D>               target;
+        // Two staging textures, used round-robin. See surfaceRenderAndReadback().
+        ComPtr<ID3D11Texture2D>               staging[2];
+        int                                   stagingIdx     = 0;
+        bool                                  stagingPending = false;
+        cudaGraphicsResource_t                cudaRes = nullptr;
+        rive::rcp<rive::gpu::RenderTargetD3D> rt;
+        uint32_t                              w = 0, h = 0;
+    };
+
+    void releaseSurface(Surface& s)
     {
-        collectGpuTimers();
-        GpuTimer& t = mGpuTimers[mGpuTimerIdx];
-        mGpuTimerIdx = (mGpuTimerIdx + 1) % kNumGpuTimers;
-        // A set whose result hasn't come back yet is skipped, not waited on.
-        const bool timed = t.disjoint.Get() != nullptr && !t.pending;
-        if (timed) {
-            mContext->Begin(t.disjoint.Get());
-            mContext->End(t.begin.Get());
+        if (s.cudaRes) {
+            if (const auto* api = cuda::Get())
+                api->graphicsUnregisterResource(s.cudaRes);
+            s.cudaRes = nullptr;
+        }
+        s.rt.reset();
+        s.target.Reset();
+        s.staging[0].Reset();
+        s.staging[1].Reset();
+        s.stagingIdx     = 0;
+        s.stagingPending = false;
+        s.w = s.h = 0;
+    }
+
+    bool ensureSurface(Surface& s, uint32_t w, uint32_t h, std::string& err)
+    {
+        if (w == 0 || h == 0) { err = "Render target has zero size."; return false; }
+        if (s.target && s.w == w && s.h == h && s.rt &&
+            (mCUDAMode ? s.cudaRes != nullptr : s.staging[0] != nullptr))
+            return true;
+
+        releaseSurface(s);
+
+        // Offscreen texture, render-target + UAV (Rive renders via UAV in
+        // atomic mode, RTV in raster-ordered mode; we enable both so it
+        // works regardless of the path the Rive runtime picks).
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width            = w;
+        d.Height           = h;
+        d.MipLevels        = 1;
+        d.ArraySize        = 1;
+        d.Format           = mTargetFormat;
+        d.SampleDesc.Count = 1;
+        d.Usage            = D3D11_USAGE_DEFAULT;
+        d.BindFlags        = D3D11_BIND_RENDER_TARGET |
+                             D3D11_BIND_SHADER_RESOURCE |
+                             D3D11_BIND_UNORDERED_ACCESS;
+        d.CPUAccessFlags   = 0;
+        d.MiscFlags        = 0;
+
+        HRESULT hr = mDevice->CreateTexture2D(&d, nullptr,
+                                              s.target.ReleaseAndGetAddressOf());
+        if (FAILED(hr) || !s.target) {
+            err = "Failed to allocate offscreen D3D11 texture.";
+            return false;
         }
 
-        mRenderTarget->setTargetTexture(mTarget);
+        if (mCUDAMode) {
+            const auto* api = cuda::Get();
+            if (!api) { err = "CUDA runtime not loaded."; return false; }
+            cudaError_t ce = api->graphicsD3D11RegisterResource(
+                &s.cudaRes, s.target.Get(),
+                cuda::kGraphicsRegisterFlagsNone);
+            if (ce != cuda::kSuccess) {
+                err = std::string("cudaGraphicsD3D11RegisterResource(target) "
+                                  "failed: ") + api->getErrorString(ce);
+                s.cudaRes = nullptr;
+                return false;
+            }
+        } else {
+            // Staging texture: CPU-readable copy destination.
+            D3D11_TEXTURE2D_DESC st{};
+            st.Width            = w;
+            st.Height           = h;
+            st.MipLevels        = 1;
+            st.ArraySize        = 1;
+            st.Format           = mTargetFormat;
+            st.SampleDesc.Count = 1;
+            st.Usage            = D3D11_USAGE_STAGING;
+            st.BindFlags        = 0;
+            st.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+            st.MiscFlags        = 0;
+
+            for (int i = 0; i < 2; ++i) {
+                hr = mDevice->CreateTexture2D(
+                    &st, nullptr, s.staging[i].ReleaseAndGetAddressOf());
+                if (FAILED(hr) || !s.staging[i]) {
+                    err = "Failed to allocate D3D11 staging texture.";
+                    return false;
+                }
+            }
+            // Nothing has been copied into either one at the new size yet, so
+            // the next readback has to be the synchronous kind.
+            s.stagingIdx     = 0;
+            s.stagingPending = false;
+        }
+
+        auto* impl = mRenderContext->static_impl_cast<rive::gpu::RenderContextD3DImpl>();
+        s.rt = impl->makeRenderTarget(w, h);
+        s.w = w;
+        s.h = h;
+        return true;
+    }
+
+    bool surfaceRenderAndReadback(Surface& s,
+                                  const rive::gpu::RenderContext::FrameDescriptor& fd,
+                                  const std::function<void(rive::Renderer*)>& draw,
+                                  void* dst, std::string& err, bool main)
+    {
+        if (!mRenderContext || !s.rt || !s.target || !s.staging[0]) {
+            err = "D3D11 backend not initialized.";
+            return false;
+        }
+
+        const auto t0 = Clock::now();
+        renderFrame(s, fd, draw, /*timed=*/main);
+        const auto t1 = Clock::now();
+
+        // Queue the GPU->staging copy for the frame we just drew.
+        //
+        // The two staging textures are used round-robin so that the Map()
+        // below reads the copy queued on the PREVIOUS cook, which the GPU has
+        // had a whole frame to retire. Mapping the copy we just queued is what
+        // made this expensive: Map(D3D11_MAP_READ) blocks until the GPU
+        // catches up, and that stall measured 2.17 ms of a 3.39 ms readback at
+        // 3840x2160 - 64% of it, against 0.08 ms of actual Rive rendering.
+        //
+        // The cost is one frame of latency: the texture handed to
+        // TouchDesigner is the frame drawn on the previous cook. The first
+        // cook after a resize has no previous copy to read, so it falls back
+        // to the synchronous path rather than emitting a blank frame.
+        const int cur  = s.stagingIdx;
+        const int prev = s.stagingIdx ^ 1;
+        mContext->CopyResource(s.staging[cur].Get(), s.target.Get());
+        // Submit now instead of letting D3D11 batch. Without this the copy sits
+        // in the command buffer until something forces a flush - which is the
+        // Map() below - so the GPU only starts the copy at the moment we begin
+        // waiting for it, and double buffering buys nothing. Flushing here is
+        // what actually gives the GPU a whole frame to retire the copy.
+        mContext->Flush();
+        const auto t2 = Clock::now();
+
+        const int readIdx = s.stagingPending ? prev : cur;
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        HRESULT hr = mContext->Map(s.staging[readIdx].Get(), 0,
+                                   D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) { err = "Map(staging) failed."; return false; }
+        const auto t3 = Clock::now();
+
+        const uint8_t* src = (const uint8_t*)mapped.pData;
+        uint8_t*       d   = (uint8_t*)dst;
+        const size_t   rowBytes = (size_t)s.w * 4;
+        if (mapped.RowPitch == rowBytes) {
+            // Tightly packed - one memcpy instead of a call per scanline.
+            std::memcpy(d, src, rowBytes * s.h);
+        } else {
+            for (uint32_t y = 0; y < s.h; ++y) {
+                std::memcpy(d + y * rowBytes,
+                            src + (size_t)y * mapped.RowPitch,
+                            rowBytes);
+            }
+        }
+        mContext->Unmap(s.staging[readIdx].Get(), 0);
+        const auto t4 = Clock::now();
+
+        s.stagingIdx     = prev;
+        s.stagingPending = true;
+
+        if (main) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            mTimings.renderMs = ms(t0, t1);
+            mTimings.copyMs   = ms(t1, t2);
+            mTimings.mapMs    = ms(t2, t3);
+            mTimings.memcpyMs = ms(t3, t4);
+            mTimings.totalMs  = ms(t0, t4);
+        }
+        return true;
+    }
+
+    bool surfaceRenderToCUDA(Surface& s,
+                             const rive::gpu::RenderContext::FrameDescriptor& fd,
+                             const std::function<void(rive::Renderer*)>& draw,
+                             void* dstCudaArray, std::string& err, bool main)
+    {
+        const auto* api = cuda::Get();
+        if (!mCUDAMode || !api) { err = "CUDA interop inactive."; return false; }
+        if (!mRenderContext || !s.rt || !s.target || !s.cudaRes) {
+            err = "D3D11 backend not initialized (CUDA).";
+            return false;
+        }
+
+        const auto t0 = Clock::now();
+        renderFrame(s, fd, draw, /*timed=*/main);
+        // Make sure the D3D work is submitted before CUDA touches the
+        // texture. cudaGraphicsMapResources synchronizes with the device,
+        // but only against submitted work.
+        mContext->Flush();
+        const auto t1 = Clock::now();
+
+        cudaError_t ce = api->graphicsMapResources(1, &s.cudaRes, mStream);
+        if (ce != cuda::kSuccess) {
+            err = std::string("cudaGraphicsMapResources(target) failed: ") +
+                  api->getErrorString(ce);
+            return false;
+        }
+        const auto t2 = Clock::now();
+        cudaArray* srcArray = nullptr;
+        ce = api->graphicsSubResourceGetMappedArray(&srcArray, s.cudaRes, 0, 0);
+        if (ce == cuda::kSuccess && srcArray) {
+            ce = copyArray(api, (cudaArray*)dstCudaArray, srcArray, s.w, s.h);
+        }
+        const auto t3 = Clock::now();
+        api->graphicsUnmapResources(1, &s.cudaRes, mStream);
+        const auto t4 = Clock::now();
+
+        if (main) {
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            mTimings.renderMs = ms(t0, t1);
+            mTimings.mapMs    = ms(t1, t2);
+            mTimings.copyMs   = ms(t2, t3);
+            mTimings.unmapMs  = ms(t3, t4);
+            mTimings.memcpyMs = 0.0;
+            mTimings.totalMs  = ms(t0, t4);
+        }
+
+        if (ce != cuda::kSuccess) {
+            err = std::string("CUDA target copy failed: ") +
+                  api->getErrorString(ce);
+            return false;
+        }
+        return true;
+    }
+
+    void renderFrame(Surface& s,
+                     const rive::gpu::RenderContext::FrameDescriptor& fd,
+                     const std::function<void(rive::Renderer*)>&      draw,
+                     bool timed)
+    {
+        GpuTimer* t = nullptr;
+        if (timed) {
+            collectGpuTimers();
+            GpuTimer& g = mGpuTimers[mGpuTimerIdx];
+            mGpuTimerIdx = (mGpuTimerIdx + 1) % kNumGpuTimers;
+            // A set whose result hasn't come back yet is skipped, not waited on.
+            if (g.disjoint.Get() != nullptr && !g.pending) t = &g;
+        }
+        if (t) {
+            mContext->Begin(t->disjoint.Get());
+            mContext->End(t->begin.Get());
+        }
+
+        s.rt->setTargetTexture(s.target);
         mRenderContext->beginFrame(fd);
         rive::RiveRenderer renderer(mRenderContext.get());
         draw(&renderer);
         rive::gpu::RenderContext::FlushResources flush;
-        flush.renderTarget = mRenderTarget.get();
+        flush.renderTarget = s.rt.get();
         flush.externalCommandBuffer = nullptr;
         mRenderContext->flush(flush);
 
-        if (timed) {
-            mContext->End(t.end.Get());
-            mContext->End(t.disjoint.Get());
-            t.pending = true;
+        if (t) {
+            mContext->End(t->end.Get());
+            mContext->End(t->disjoint.Get());
+            t->pending = true;
         }
     }
 
@@ -583,27 +673,13 @@ private:
         return api->memcpy3DAsync(&p, mStream);
     }
 
-    void unregisterTargetCUDA()
-    {
-        if (mTargetCudaRes) {
-            if (const auto* api = cuda::Get())
-                api->graphicsUnregisterResource(mTargetCudaRes);
-            mTargetCudaRes = nullptr;
-        }
-    }
-
     bool                         mCUDAMode = false;
     DXGI_FORMAT                  mTargetFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     ComPtr<ID3D11Device>         mDevice;
     ComPtr<ID3D11DeviceContext>  mContext;
-    ComPtr<ID3D11Texture2D>      mTarget;
-    // Two staging textures, used round-robin. See renderAndReadback().
-    ComPtr<ID3D11Texture2D>      mStaging[2];
-    int                          mStagingIdx     = 0;
-    bool                         mStagingPending = false;
-    cudaGraphicsResource_t       mTargetCudaRes = nullptr;
+    Surface                      mMain;   // the Rive TOP's output
+    Surface                      mMask;   // the Mask output (color buffer 1)
     cudaStream_t                 mStream = nullptr;
-    uint32_t                     mW = 0, mH = 0;
 
     struct GpuTimer {
         ComPtr<ID3D11Query> disjoint, begin, end;
@@ -616,7 +692,6 @@ private:
     Slot mSlots[kMaxImageSlots];
 
     std::unique_ptr<rive::gpu::RenderContext> mRenderContext;
-    rive::rcp<rive::gpu::RenderTargetD3D>     mRenderTarget;
 };
 
 std::unique_ptr<IBackend> CreateBackend(bool cudaMode)

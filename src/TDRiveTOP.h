@@ -22,6 +22,7 @@
 #include "rive/viewmodel/runtime/viewmodel_instance_runtime.hpp"
 
 #include "IBackend.h"
+#include "rive_mask.h"
 
 class TDRiveTOP : public TD::TOP_CPlusPlusBase {
 public:
@@ -114,6 +115,18 @@ private:
     TD::TOP_Context*               mContext = nullptr;
     std::unique_ptr<tdrive::IBackend> mBackend;
     bool                           mBackendReady = false;
+
+    // Mask output (see rive_mask.h). The file is imported through the
+    // tracking factory only while the mask is on: mWantTracked is what the
+    // last cook asked for, mLoadedTracked what the loaded file was imported
+    // with, and a mismatch reloads the file. Declared after mBackend so it is
+    // destroyed first - it forwards to the backend's factory.
+    std::unique_ptr<tdrive::TrackingFactory> mTrackingFactory;
+    bool                 mWantTracked   = false;
+    bool                 mLoadedTracked = false;
+    // TrackingFactory::paintsMade() when tagPaintOwners() last ran; a
+    // mismatch means there are paints without an owner stamp yet.
+    uint64_t             mOwnersTaggedAt = ~0ull;
 
     // Loaded file + scene
     rive::rcp<rive::File>                       mFile;
