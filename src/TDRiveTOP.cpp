@@ -305,6 +305,20 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
         np.maxSliders[0] = 4.0;
         m->appendFloat(np);
     }
+    {
+        // Render only when something visible can have changed: the scene
+        // reported a change while advancing, an input pushed a new value, or
+        // the output size / framing / background moved. Otherwise the cook
+        // skips the render and the copy into TouchDesigner, and the TOP keeps
+        // showing its last frame. The state machine still advances every
+        // cook, so a settled artboard wakes the moment it has something to
+        // show. Off renders every cook, as before.
+        OP_NumericParameter np("Skipidle");
+        np.label = "Skip Idle Frames";
+        np.page  = "Rive";
+        np.defaultValues[0] = 1.0;
+        m->appendToggle(np);
+    }
     // NOTE: no custom Resolution parameter. The output size comes from the
     // node's built-in Common page, like any other TOP - see computeResolution().
     // Texture injection: each slot pairs a source TOP with the name of the
@@ -491,6 +505,8 @@ constexpr const char* kInfoChanNames[] = {
     "file_loaded", "artboard_loaded", "scene_loaded",
     // The Mask output's whole pass (render + copy out), 0 when it is off.
     "mask_ms",
+    // 1 when this cook rendered, 0 when Skip Idle Frames skipped it.
+    "rendered",
 };
 constexpr int32_t kNumInfoChans =
     (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
@@ -513,6 +529,7 @@ void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
         t.renderGpuMs, (double)mOutW, (double)mOutH,
         mFile ? 1.0 : 0.0, mArtboard ? 1.0 : 0.0, mScene ? 1.0 : 0.0,
         t.maskMs,
+        mRendered ? 1.0 : 0.0,
     };
     // These two lists are indexed by the same 'index'; keep them in step.
     static_assert((int32_t)(sizeof(values) / sizeof(values[0])) == kNumInfoChans,
@@ -760,6 +777,7 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
     mFile = std::move(file);
     mLoadedPath = path;
     mLoadedTracked = mWantTracked;
+    mRenderFramesLeft = 2;   // a new file always shows
     clearError();
     return true;
 }
@@ -816,6 +834,7 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
 
     mArtboard = std::move(ab);
     mLoadedArtboard = name;
+    mRenderFramesLeft = 2;   // a new artboard always shows
     // A success clears the error, so a remembered rejection would otherwise
     // come back silent if the user switches back to it.
     mArtboardRejected = false;
@@ -876,6 +895,7 @@ bool TDRiveTOP::selectSceneIfNeeded(const char* smC)
     }
     mScene = std::move(scene);
     mLoadedStateMachine = sm;
+    mRenderFramesLeft = 2;   // a new scene always shows
     mPrevChopValues.clear();
 
     // Data binding: bindArtboardViewModel() binds the view-model instance to
@@ -971,13 +991,13 @@ void TDRiveTOP::applyInputsFromCHOP(const OP_CHOPInput* chop)
         switch (it->second->inputCoreType()) {
             case kInputTypeNumber: {
                 auto* n = static_cast<rive::SMINumber*>(it->second);
-                if (n->value() != v) n->value(v);
+                if (n->value() != v) { n->value(v); mInputsChanged = true; }
                 break;
             }
             case kInputTypeBool: {
                 auto* b = static_cast<rive::SMIBool*>(it->second);
                 bool nb = v != 0.0f;
-                if (b->value() != nb) b->value(nb);
+                if (b->value() != nb) { b->value(nb); mInputsChanged = true; }
                 break;
             }
             case kInputTypeTrigger: {
@@ -985,6 +1005,7 @@ void TDRiveTOP::applyInputsFromCHOP(const OP_CHOPInput* chop)
                 float prev = (pit == mPrevChopValues.end()) ? 0.0f : pit->second;
                 if (prev <= 0.0f && v > 0.0f) {
                     static_cast<rive::SMITrigger*>(it->second)->fire();
+                    mInputsChanged = true;
                 }
                 break;
             }
@@ -1023,26 +1044,26 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
 
         if (mVMRuntime) {
             if (auto* sp = mVMRuntime->propertyString(name)) {
-                if (sp->value() != value) sp->value(value);
+                if (sp->value() != value) { sp->value(value); mInputsChanged = true; }
                 handled = true;
             } else if (auto* np = mVMRuntime->propertyNumber(name)) {
-                try { float v = std::stof(value); if (np->value() != v) np->value(v); }
+                try { float v = std::stof(value); if (np->value() != v) { np->value(v); mInputsChanged = true; } }
                 catch (...) {}
                 handled = true;
             } else if (auto* bp = mVMRuntime->propertyBoolean(name)) {
                 bool nb = dat_value_truthy(value);
-                if (bp->value() != nb) bp->value(nb);
+                if (bp->value() != nb) { bp->value(nb); mInputsChanged = true; }
                 handled = true;
             } else if (auto* tp = mVMRuntime->propertyTrigger(name)) {
                 auto pit = mPrevDatValues.find(name);
                 bool changed = (pit == mPrevDatValues.end()) || (pit->second != value);
-                if (changed && dat_value_truthy(value)) tp->trigger();
+                if (changed && dat_value_truthy(value)) { tp->trigger(); mInputsChanged = true; }
                 handled = true;
             } else if (auto* ep = mVMRuntime->propertyEnum(name)) {
                 // Rive ignores a value that isn't one of the enum's cases, so a
                 // typo just leaves the property where it was. The Info DAT's
                 // "options" column lists the accepted values.
-                if (ep->value() != value) ep->value(value);
+                if (ep->value() != value) { ep->value(value); mInputsChanged = true; }
                 handled = true;
             } else if (auto* ap = mVMRuntime->propertyArtboard(name)) {
                 // An artboard property takes the NAME of an artboard in this
@@ -1057,6 +1078,7 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 if (!value.empty() && mFile && ap->artboardName() != value) {
                     if (auto bindable = mFile->bindableArtboardNamed(value)) {
                         ap->value(std::move(bindable));
+                        mInputsChanged = true;
                     }
                 }
                 handled = true;
@@ -1078,14 +1100,14 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                             auto* n = static_cast<rive::SMINumber*>(in);
                             try {
                                 float v = std::stof(value);
-                                if (n->value() != v) n->value(v);
+                                if (n->value() != v) { n->value(v); mInputsChanged = true; }
                             } catch (...) {}
                             break;
                         }
                         case kInputTypeBool: {
                             auto* b = static_cast<rive::SMIBool*>(in);
                             const bool nb = dat_value_truthy(value);
-                            if (b->value() != nb) b->value(nb);
+                            if (b->value() != nb) { b->value(nb); mInputsChanged = true; }
                             break;
                         }
                         case kInputTypeTrigger: {
@@ -1095,8 +1117,10 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                             auto pit = mPrevDatValues.find(name);
                             const bool changed = (pit == mPrevDatValues.end()) ||
                                                  (pit->second != value);
-                            if (changed && dat_value_truthy(value))
+                            if (changed && dat_value_truthy(value)) {
                                 static_cast<rive::SMITrigger*>(in)->fire();
+                                mInputsChanged = true;
+                            }
                             break;
                         }
                         default: break;
@@ -1109,7 +1133,7 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
 
         if (!handled && mArtboard) {
             if (auto* tvr = mArtboard->getTextRun(name, "")) {
-                if (tvr->text() != value) tvr->text(value);
+                if (tvr->text() != value) { tvr->text(value); mInputsChanged = true; }
                 handled = true;
             }
         }
@@ -1130,6 +1154,7 @@ void TDRiveTOP::bindSlotImage(int slot, const char* propName,
     auto* ip = mVMRuntime->propertyImage(propName);
     if (!ip) return;  // property doesn't exist / isn't an image - skip
     ip->value(img);
+    mInputsChanged = true;
     mBoundSlotImage[slot] = img;
 }
 
@@ -1322,6 +1347,7 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     int fitIdx   = inputs->getParInt("Fit");
     int alignIdx = inputs->getParInt("Alignment");
     double speed = inputs->getParDouble("Speed");
+    const bool skipIdle = inputs->getParInt("Skipidle") != 0;
     double bg[4] = {0,0,0,0};
     inputs->getParDouble4("Bgcolor", bg[0], bg[1], bg[2], bg[3]);
     const bool   maskOn   = inputs->getParInt("Maskoutput") != 0;
@@ -1406,8 +1432,45 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         }
     }
 
-    if (ok && mScene)        mScene->advanceAndApply(dt);
-    else if (ok && mArtboard) mArtboard->advance(dt);
+    // Both report whether anything moved: advanceAndApply() folds in the
+    // state machine, the artboard's update pass (layout, data binding, text)
+    // and nested artboards; a settled artboard returns false.
+    bool sceneChanged = false;
+    if (ok && mScene)        sceneChanged = mScene->advanceAndApply(dt);
+    else if (ok && mArtboard) sceneChanged = mArtboard->advance(dt);
+
+    // ---- Skip Idle Frames ------------------------------------------------
+    // Render when the scene changed, an input pushed a value, anything
+    // outside Rive that shapes the frame moved, or there is nothing loaded
+    // (an unloaded node renders its cleared frame like before). Injected
+    // textures always render: Rive cannot see a TOP's pixels change.
+    {
+        RenderKey key;
+        key.w = resW;  key.h = resH;  key.fit = fitIdx;  key.align = alignIdx;
+        for (int i = 0; i < 4; ++i) key.bg[i] = bg[i];
+        key.artboard = mArtboard.get();
+        key.scene    = mScene.get();
+        key.maskOn   = maskOn ? 1 : 0;
+        key.maskMode = maskMode == tdrive::MaskMode::Alpha ? 1 : 0;
+        key.maskRes  = maskRes;
+
+        bool imageInputs = false;
+        for (int slot = 0; slot < tdrive::kMaxImageSlots && !imageInputs; ++slot) {
+            char parName[16];
+            std::snprintf(parName, sizeof(parName), "Image%d", slot + 1);
+            imageInputs = inputs->getParTOP(parName) != nullptr;
+        }
+
+        if (!skipIdle || !ok || sceneChanged || mInputsChanged || imageInputs ||
+            !key.sameAs(mLastRenderKey)) {
+            mRenderFramesLeft = 2;
+        }
+        mLastRenderKey = key;
+        mInputsChanged = false;
+        mRendered      = false;
+        if (mRenderFramesLeft <= 0) return;   // idle: the TOP keeps its frame
+        --mRenderFramesLeft;
+    }
 
     // Build the frame descriptor.
     rive::gpu::RenderContext::FrameDescriptor fd;
@@ -1649,6 +1712,7 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         auto te = Clock::now();
         mContext->endCUDAOperations(nullptr);
         mCudaEndMs = msSince(te);
+        mRendered = rendered;
         if (!rendered && !rerr.empty()) setError(rerr);
         return;
     }
@@ -1679,6 +1743,7 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     up.firstPixel              = TD::TOP_FirstPixel::TopLeft;
     up.colorBufferIndex        = 0;
     output->uploadBuffer(&buf, up, nullptr);
+    mRendered = true;
 
     // Mask output -> color buffer 1 (fetch with a Render Select TOP).
     if (doMask) {
