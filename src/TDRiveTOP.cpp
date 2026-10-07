@@ -281,6 +281,12 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
         m->appendPulse(np);
     }
     {
+        OP_NumericParameter np("Initialize");
+        np.label = "Initialize";
+        np.page  = "Rive";
+        m->appendPulse(np);
+    }
+    {
         OP_StringParameter sp("Artboard");
         sp.label = "Artboard";
         sp.page  = "Rive";
@@ -423,8 +429,16 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
 
 void TDRiveTOP::pulsePressed(const char* name, void*)
 {
-    if (name && std::string(name) == "Reload") {
+    const std::string n = name ? name : "";
+    if (n == "Reload") {
         releaseFile();
+    } else if (n == "Initialize") {
+        // Back to the artboard's initial state without touching the disk:
+        // drop the artboard, state machine and view model, keep the parsed
+        // rive::File, and the next cook instances them again from memory.
+        // Same result as Reload for an unchanged file, without the re-read
+        // and re-import.
+        releaseArtboard();
     }
 }
 
