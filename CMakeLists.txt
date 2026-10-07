@@ -70,6 +70,7 @@ endif()
 # -----------------------------------------------------------------------------
 set(TDRIVE_SOURCES
     src/TDRiveTOP.cpp
+    src/rive_mask.cpp
 )
 
 if(APPLE)

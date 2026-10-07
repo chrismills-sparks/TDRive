@@ -46,6 +46,9 @@ struct ReadbackTimings {
     // back a few frames later so they never stall. 0 until a result arrives
     // and on backends without the queries.
     double renderGpuMs = 0.0;
+    // The whole mask pass (render + copy out), CPU wall-clock ms; 0 when the
+    // mask is off.
+    double maskMs = 0.0;
 };
 
 class IBackend {
@@ -132,6 +135,35 @@ public:
         void* /*dstCudaArray*/, std::string& err)
     {
         err = "CUDA interop is not available on this backend.";
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Mask output: a second, independently sized render target on the SAME
+    // render context, so the artboard's paints, paths and images are shared.
+    // Same contracts as ensureRenderTarget / renderAndReadback / renderToCUDA.
+    // -------------------------------------------------------------------------
+    virtual bool ensureMaskTarget(uint32_t /*width*/, uint32_t /*height*/,
+                                  std::string& err)
+    {
+        err = "Mask output is not supported on this backend.";
+        return false;
+    }
+    virtual void releaseMaskTarget() {}
+    virtual bool renderMaskAndReadback(
+        const rive::gpu::RenderContext::FrameDescriptor& /*fd*/,
+        const std::function<void(rive::Renderer*)>&      /*draw*/,
+        void* /*dst*/, std::string& err)
+    {
+        err = "Mask output is not supported on this backend.";
+        return false;
+    }
+    virtual bool renderMaskToCUDA(
+        const rive::gpu::RenderContext::FrameDescriptor& /*fd*/,
+        const std::function<void(rive::Renderer*)>&      /*draw*/,
+        void* /*dstCudaArray*/, std::string& err)
+    {
+        err = "Mask output is not supported on this backend.";
         return false;
     }
 };

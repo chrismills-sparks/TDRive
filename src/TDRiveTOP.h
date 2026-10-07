@@ -22,6 +22,7 @@
 #include "rive/viewmodel/runtime/viewmodel_instance_runtime.hpp"
 
 #include "IBackend.h"
+#include "rive_mask.h"
 
 class TDRiveTOP : public TD::TOP_CPlusPlusBase {
 public:
@@ -115,6 +116,18 @@ private:
     std::unique_ptr<tdrive::IBackend> mBackend;
     bool                           mBackendReady = false;
 
+    // Mask output (see rive_mask.h). The file is imported through the
+    // tracking factory only while the mask is on: mWantTracked is what the
+    // last cook asked for, mLoadedTracked what the loaded file was imported
+    // with, and a mismatch reloads the file. Declared after mBackend so it is
+    // destroyed first - it forwards to the backend's factory.
+    std::unique_ptr<tdrive::TrackingFactory> mTrackingFactory;
+    bool                 mWantTracked   = false;
+    bool                 mLoadedTracked = false;
+    // TrackingFactory::paintsMade() when tagPaintOwners() last ran; a
+    // mismatch means there are paints without an owner stamp yet.
+    uint64_t             mOwnersTaggedAt = ~0ull;
+
     // Loaded file + scene
     rive::rcp<rive::File>                       mFile;
     std::unique_ptr<rive::ArtboardInstance>     mArtboard;
@@ -148,13 +161,17 @@ private:
         double      bg[4] = {-1.0, -1.0, -1.0, -1.0};
         const void* artboard = nullptr;
         const void* scene    = nullptr;
+        // Mask page: a mask change has to re-render as much as the colour.
+        int32_t     maskOn = -1, maskMode = -1;
+        double      maskRes = -1.0;
         bool        loaded   = false;
         bool sameAs(const RenderKey& o) const
         {
             return w == o.w && h == o.h && fit == o.fit && align == o.align &&
                    bg[0] == o.bg[0] && bg[1] == o.bg[1] && bg[2] == o.bg[2] &&
                    bg[3] == o.bg[3] && artboard == o.artboard && scene == o.scene &&
-                   loaded == o.loaded;
+                   maskOn == o.maskOn && maskMode == o.maskMode &&
+                   maskRes == o.maskRes && loaded == o.loaded;
         }
     };
     RenderKey mLastRenderKey;
