@@ -157,6 +157,40 @@ bool dat_value_truthy(const std::string& s)
     try { return std::stof(s) > 0.0f; } catch (...) { return false; }
 }
 
+// A Rive colour as "#AARRGGBB". Rive stores colours as one ARGB integer, so
+// this is its native order - not CSS's #RRGGBBAA.
+std::string format_argb(uint32_t argb)
+{
+    char buf[10];
+    std::snprintf(buf, sizeof(buf), "#%08X", argb);
+    return buf;
+}
+
+// Parses "#RRGGBB" or "#AARRGGBB" (the '#' optional, surrounding whitespace
+// ignored). Returns the number of hex digits read - 6 or 8 - with the value in
+// 'out', or 0 when the text is neither. A 6-digit value carries no alpha:
+// the caller decides what alpha it keeps.
+int parse_hex_color(const std::string& text, uint32_t& out)
+{
+    size_t b = text.find_first_not_of(" \t\r\n");
+    size_t e = text.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos) return 0;
+    std::string s = text.substr(b, e - b + 1);
+    if (!s.empty() && s[0] == '#') s.erase(0, 1);
+    if (s.size() != 6 && s.size() != 8) return 0;
+    uint32_t v = 0;
+    for (char c : s) {
+        int d;
+        if      (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return 0;
+        v = (v << 4) | (uint32_t)d;
+    }
+    out = v;
+    return (int)s.size();
+}
+
 // Describes the first nested linear animation reachable from 'ab' whose
 // animation index does not exist on the artboard it nests, or returns "".
 //
@@ -623,6 +657,11 @@ std::vector<TDRiveTOP::SchemaEntry> TDRiveTOP::propertySchema()
             case rive::DataType::trigger:
                 e.value = "(pulse)";
                 break;
+            case rive::DataType::color: {
+                if (auto* cp = mVMRuntime->propertyColor(path))
+                    e.value = format_argb((uint32_t)cp->value());
+                break;
+            }
             case rive::DataType::enumType: {
                 if (auto* ep = mVMRuntime->propertyEnum(path)) {
                     e.value   = ep->value();
@@ -1064,6 +1103,21 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 // typo just leaves the property where it was. The Info DAT's
                 // "options" column lists the accepted values.
                 if (ep->value() != value) { ep->value(value); mInputsChanged = true; }
+                handled = true;
+            } else if (auto* cp = mVMRuntime->propertyColor(name)) {
+                // "#AARRGGBB" sets the whole colour; "#RRGGBB" sets RGB and
+                // keeps the alpha already on the property (the .riv's, until
+                // something replaces it). An empty cell leaves it alone.
+                uint32_t parsed = 0;
+                const int digits = parse_hex_color(value, parsed);
+                const uint32_t cur  = (uint32_t)cp->value();
+                uint32_t next = cur;
+                if (digits == 8)      next = parsed;
+                else if (digits == 6) next = (cur & 0xFF000000u) | parsed;
+                else if (!value.empty())
+                    addWarning("Colour '" + name + "' needs #AARRGGBB or "
+                               "#RRGGBB, got '" + value + "'.");
+                if (next != cur) { cp->value((int)next); mInputsChanged = true; }
                 handled = true;
             } else if (auto* ap = mVMRuntime->propertyArtboard(name)) {
                 // An artboard property takes the NAME of an artboard in this
@@ -1949,14 +2003,36 @@ bool DictSetDouble(PyObject* d, const char* key, double v)
 // The TD parameter style a schema entry maps to, or nullptr when the entry
 // cannot be driven as a parameter.
 //
+bool DictSetDoubleList(PyObject* d, const char* key,
+                       const std::vector<double>& vals)
+{
+    PyObject* list = PyList_New(0);
+    if (!list) return false;
+    for (double v : vals) {
+        PyObject* o = PyFloat_FromDouble(v);
+        if (!o) { Py_DECREF(list); return false; }
+        const bool appended = PyList_Append(list, o) == 0;
+        Py_DECREF(o);
+        if (!appended) { Py_DECREF(list); return false; }
+    }
+    const bool ok = PyDict_SetItemString(d, key, list) == 0;
+    Py_DECREF(list);
+    return ok;
+}
+
 // The list is deliberately narrower than the type list the schema reports: an
 // entry only earns a parameter if applyStringsFromDAT() can actually apply it.
-// vm:viewModel is a branch rather than a value; vm:list, vm:color, vm:image
-// and vm:font have no write path yet, and generating dead parameters for them
-// would look like support that isn't there.
+// vm:viewModel is a branch rather than a value; vm:list, vm:image and vm:font
+// have no write path yet, and generating dead parameters for them would look
+// like support that isn't there.
+//
+// vm:color is a 4-component RGBA parameter: a Rive colour always carries
+// alpha. TD reports RGB and RGBA parameters alike as style "RGBA" and tells
+// them apart by size, which is how a control COMP picks #RRGGBB or #AARRGGBB.
 const char* ParStyleForType(const std::string& type, bool container)
 {
     if (container) return nullptr;
+    if (type == "vm:color")    return "RGBA";
     if (type == "vm:string")   return "Str";
     if (type == "vm:number")   return "Float";
     if (type == "vm:integer")  return "Int";
@@ -2032,13 +2108,15 @@ PyObject* pyGetTdJSONPars(PyObject* self, void*)
             (slash == std::string::npos) ? std::string("Rive")
                                          : e.path.substr(0, slash);
 
+        const bool isColor = std::strcmp(style, "RGBA") == 0;
+
         bool ok =
             DictSetStr(d, "name", name) &&
             // The whole point: the label is the Rive path, verbatim.
             DictSetStr(d, "label", e.path) &&
             DictSetStr(d, "page", page) &&
             DictSetStr(d, "style", style) &&
-            DictSetLong(d, "size", 1) &&
+            DictSetLong(d, "size", isColor ? 4 : 1) &&
             DictSetBool(d, "enable", true) &&
             DictSetBool(d, "readOnly", false) &&
             DictSetBool(d, "startSection", false) &&
@@ -2065,6 +2143,23 @@ PyObject* pyGetTdJSONPars(PyObject* self, void*)
                                       ? std::abs(v) * 2.0 : 100.0;
                 ok = ok && DictSetDouble(d, "normMin", 0.0)
                         && DictSetDouble(d, "normMax", hi)
+                        && DictSetBool(d, "clampMin", false)
+                        && DictSetBool(d, "clampMax", false);
+            } else if (isColor) {
+                // The authored colour as 0..1 R, G, B, A - TDJSON's per-
+                // component default list. Range and clamps match a native
+                // appendRGBA() parameter.
+                uint32_t argb = 0xFF000000u;
+                parse_hex_color(e.value, argb);
+                const auto ch = [argb](int shift) {
+                    return ((argb >> shift) & 0xFFu) / 255.0;
+                };
+                ok = ok && DictSetDoubleList(d, "default",
+                                             {ch(16), ch(8), ch(0), ch(24)})
+                        && DictSetDouble(d, "min", 0.0)
+                        && DictSetDouble(d, "max", 1.0)
+                        && DictSetDouble(d, "normMin", 0.0)
+                        && DictSetDouble(d, "normMax", 1.0)
                         && DictSetBool(d, "clampMin", false)
                         && DictSetBool(d, "clampMax", false);
             } else if (s == "Toggle") {
@@ -2148,7 +2243,7 @@ TD_VIS DLLEXPORT void FillTOPPluginInfo(TD::TOP_PluginInfo* info)
     // stop every existing .toe containing a Rive node (major 0) from loading.
     // Minor only has to be >= what the project was saved with.
     custom.majorVersion = 0;
-    custom.minorVersion = 9;
+    custom.minorVersion = 10;
 
     custom.minInputs = 0;
     custom.maxInputs = 0;
