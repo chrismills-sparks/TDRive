@@ -153,6 +153,11 @@ first cell of row 0 is exactly `name` / `Name` / `key` / `Key` /
   the property's type (`string`, `number`, `bool`) and written. Triggers
   fire on a rising edge — when the cell content changes AND parses to a
   truthy value (`1`, `true`, `fire`, `on`, `yes`, or a positive number).
+- A **colour** property (`vm:color`) takes hex, `#` optional:
+  `#AARRGGBB` sets the whole colour — Rive's own ARGB order, not CSS's
+  `#RRGGBBAA` — and `#RRGGBB` sets RGB while keeping the property's current
+  alpha. An empty cell leaves it alone; anything else raises a warning
+  naming the property.
 - Otherwise, if the selected state machine declares an input with that
   name, the value is applied to it. The **Inputs CHOP** stays the better
   path for *animated* numerics — no float→string→float round trip per
@@ -160,9 +165,9 @@ first cell of row 0 is exactly `name` / `Name` / `key` / `Key` /
 - Otherwise, the TOP falls back to `artboard->getTextRun(name, "")` so
   older files (named text runs, no view model) keep working.
 
-The Info DAT lists `vm:string` / `vm:number` / `vm:bool` / `vm:trigger`
-rows for each view-model property, alongside the SMI inputs. Use it as the
-reference when populating your Strings DAT.
+The Info DAT lists a row per view-model property (`vm:string`, `vm:number`,
+`vm:bool`, `vm:trigger`, `vm:color` as `#AARRGGBB`, ...), alongside the SMI
+inputs. Use it as the reference when populating your Strings DAT.
 
 ## Generating controls automatically (RiveControl.tox)
 
