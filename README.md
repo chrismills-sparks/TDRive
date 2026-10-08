@@ -103,6 +103,7 @@ operators palette.
 | -------------- | ---------------------------------------------------------------- |
 | Riv File       | File picker for the `.riv` file.                                 |
 | Reload         | Pulse — reloads the file from disk.                              |
+| Initialize     | Pulse — restarts the artboard, state machine and view model from their initial state, keeping the loaded file. Cheaper than Reload when the file has not changed. |
 | Artboard       | Dynamic menu of artboards found in the file. Empty = default.    |
 | State Machine  | Dynamic menu of state machines on the selected artboard.         |
 | Inputs CHOP    | CHOP whose channels drive the state machine inputs (see below).  |
