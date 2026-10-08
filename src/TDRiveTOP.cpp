@@ -19,7 +19,9 @@
 #include "rive/math/aabb.hpp"
 #include "rive/math/mat2d.hpp"
 #include "rive/animation/linear_animation_instance.hpp"
+#include "rive/animation/nested_linear_animation.hpp"
 #include "rive/animation/state_machine_input_instance.hpp"
+#include "rive/nested_artboard.hpp"
 #include "rive/text/text_value_run.hpp"
 #include "rive/viewmodel/runtime/viewmodel_runtime.hpp"
 #include "rive/viewmodel/runtime/viewmodel_instance_string_runtime.hpp"
@@ -153,6 +155,48 @@ bool dat_value_truthy(const std::string& s)
     if (s == "1" || s == "true" || s == "True" || s == "TRUE" ||
         s == "fire" || s == "on" || s == "On" || s == "yes") return true;
     try { return std::stof(s) > 0.0f; } catch (...) { return false; }
+}
+
+// Describes the first nested linear animation reachable from 'ab' whose
+// animation index does not exist on the artboard it nests, or returns "".
+//
+// Rive's runtime does not check this. NestedLinearAnimation::initializeAnimation()
+// hands Artboard::animation(id) - nullptr when the index is out of range -
+// straight to LinearAnimationInstance, whose null check is an assert that
+// release builds compile out. Instancing such an artboard dereferences null
+// inside Artboard::initialize(), and TouchDesigner's crash handler then
+// deadlocks, so it presents as a frozen UI rather than a crash. The Rive editor
+// tolerates the dangling reference (typically an animation deleted or
+// reordered after it was nested), so the file looks fine there.
+//
+// Walking the FILE-level artboards is safe: nested animations and the source
+// artboard are attached at import, before any instance exists.
+std::string findBrokenNestedAnimation(rive::Artboard* ab, int depth = 0)
+{
+    // Nesting can chain through several artboards; the bound stops a malformed
+    // cycle from recursing forever.
+    if (!ab || depth > 16) return {};
+    for (rive::Core* obj : ab->objects()) {
+        if (!obj || !obj->is<rive::NestedArtboard>()) continue;
+        auto* nested = obj->as<rive::NestedArtboard>();
+        rive::Artboard* source = nested->sourceArtboard();
+        if (!source) continue;
+        for (rive::NestedAnimation* na : nested->nestedAnimations()) {
+            if (!na || !na->is<rive::NestedLinearAnimation>()) continue;
+            const auto id = na->as<rive::NestedLinearAnimation>()->animationId();
+            if ((size_t)id >= source->animationCount()) {
+                return "Artboard '" + ab->name() + "' nests '" +
+                       source->name() + "' (as '" + nested->name() +
+                       "') playing animation #" + std::to_string(id) +
+                       ", but '" + source->name() + "' has only " +
+                       std::to_string(source->animationCount()) +
+                       ". Re-pick that nested animation in the Rive editor.";
+            }
+        }
+        std::string deeper = findBrokenNestedAnimation(source, depth + 1);
+        if (!deeper.empty()) return deeper;
+    }
+    return {};
 }
 
 // True when the plugin registered with TOP_ExecuteMode::CUDA (decided once
@@ -613,6 +657,17 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
 // one level up - and the hang/crash on changing the File parameter.
 void TDRiveTOP::releaseFile()
 {
+    releaseArtboard();
+    mFile.reset();
+    mLoadedPath.clear();
+    mArtboardRejected = false;
+    mRejectedArtboard.clear();
+}
+
+// The artboard-level half of releaseFile(): view model, scene, then the
+// artboard instance they were built from.
+void TDRiveTOP::releaseArtboard()
+{
     mVMRuntime.reset();
     mVmProps.clear();
     // RenderImages bound into the outgoing view model; bindArtboardViewModel()
@@ -621,8 +676,6 @@ void TDRiveTOP::releaseFile()
     mSMI = nullptr;
     mScene.reset();
     mArtboard.reset();
-    mFile.reset();
-    mLoadedPath.clear();
     mLoadedArtboard.clear();
     mLoadedStateMachine.clear();
     mPrevChopValues.clear();
@@ -671,14 +724,30 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
     std::string name = nameC ? nameC : "";
     if (mArtboard && name == mLoadedArtboard) return true;
 
+    // Refuse an artboard Rive would dereference null on while instancing it -
+    // see findBrokenNestedAnimation(). Remembered per name, so a rejected
+    // artboard is not re-walked every cook; releaseFile() forgets it.
+    if (mArtboardRejected && name == mRejectedArtboard) return false;
+    {
+        rive::Artboard* source =
+            name.empty() ? mFile->artboard() : mFile->artboard(name);
+        const std::string broken = findBrokenNestedAnimation(source);
+        if (!broken.empty()) {
+            releaseArtboard();
+            mArtboardRejected = true;
+            mRejectedArtboard = name;
+            setError(broken);
+            return false;
+        }
+    }
+
     std::unique_ptr<rive::ArtboardInstance> ab =
         name.empty() ? mFile->artboardDefault() : mFile->artboardNamed(name);
     if (!ab) {
         setError(name.empty()
                  ? std::string("No default artboard in file.")
                  : std::string("Artboard not found: ") + name);
-        mArtboard.reset(); mScene.reset(); mSMI = nullptr;
-        mLoadedStateMachine.clear();
+        releaseArtboard();
         return false;
     }
 
@@ -701,6 +770,9 @@ bool TDRiveTOP::selectArtboardIfNeeded(const char* nameC)
 
     mArtboard = std::move(ab);
     mLoadedArtboard = name;
+    // A success clears the error, so a remembered rejection would otherwise
+    // come back silent if the user switches back to it.
+    mArtboardRejected = false;
 
     // Snapshot the artboard's authored frame NOW, before anything advances it.
     //
