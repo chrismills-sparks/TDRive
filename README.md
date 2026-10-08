@@ -197,12 +197,21 @@ for e in op('rive1').propertySchema:
 The trick that makes `tdJSONPars` work without a lookup table: each entry
 carries the **Rive property path in its `label`**, not its name. A path
 like `payoffCard/barGraph1Label` is not a legal TouchDesigner parameter
-name, but it is a perfectly legal label — so a Parameter DAT set to emit
-labels (`name=False, label=True, header=False`) produces exactly the
-two-column table the Strings DAT parameter already consumes.
+name, but it is a perfectly legal label — so a Parameter DAT that emits
+labels lands the Rive path verbatim, ready for the Strings DAT.
+
+Colours are the one property that needs more than one parameter: a
+`vm:color` becomes a native **RGBA** parameter (a Rive colour always carries
+alpha), defaulting to the authored colour. TouchDesigner reports RGB and RGBA
+parameters alike as style `RGBA`, so they are told apart by size.
+RiveControl's Parameter DAT therefore also emits style, size and parameter
+group, and a Script DAT (`strings_out`) folds each colour's components into
+one hex row — `#AARRGGBB` for a 4-component parameter, `#RRGGBB` for a
+3-component one — passing every other row through as `label  value`.
 
 **Using the component:** drop `RiveControl.tox` into your project, set its
-**Rive TOP** parameter, and pulse **Build**. It generates one parameter per
+**Rive TOP** parameter, and pulse **Build** (parameter `Buildpars`). It
+generates one parameter per
 addressable property (grouped onto a page per nested view model) and points
 that TOP's Strings DAT at its own output by a relative path, so the reference
 stays correct when the enclosing component is cloned or moved. Build is
@@ -212,14 +221,16 @@ updates parameters without disturbing values you have already set.
 Expressions and binds on generated parameters are safe to rely on. Build and
 Clear record them in the component's storage, keyed by Rive property path, and
 Build re-applies them to any parameter it has to recreate for the exact same
-path. Setting a parameter back to constant mode forgets its record.
+path. Records are per component, so binding a colour's R, G, B and A
+separately is fine. Setting a parameter back to constant mode forgets its
+record.
 
 **Clear** removes the generated parameters — separate from Build precisely
 because it discards their values and exports (expressions and binds come back
 on the next Build).
 
 Properties with no write path (`vm:viewModel` containers, `vm:list`,
-`vm:color`, `vm:image`, `vm:font`) are deliberately skipped rather than
+`vm:image`, `vm:font`) are deliberately skipped rather than
 generated as parameters that would do nothing; the Status parameter reports
 how many.
 
