@@ -252,6 +252,21 @@ already carry, so input pixels are passed through unchanged in both modes. A
 TOP whose alpha is not premultiplied (e.g. unpremultiplied with a Level TOP)
 will come out too bright at its transparent edges.
 
+## Mask output (Windows)
+
+**Mask Output** (Mask page) renders a greyscale matte of the same frame to
+color buffer 1; fetch it with a Render Select TOP. Each object writes its
+world opacity and overlapping objects combine with max, so a group fading to
+50% masks as 0.5 throughout instead of its stacked children adding up.
+
+- **Mask Resolution**: fraction of the output size (default 0.5).
+- **Mask Mode**: *Presence x Opacity* (shape coverage) or *Paint Alpha x
+  Opacity* (also factors in each paint's own alpha).
+
+Feathered paints (shadows, glows) keep their authored alpha; images mask as
+their rectangle. Turning the toggle on or off reloads the file. The Info
+CHOP's `mask_ms` is the mask pass's cost.
+
 ## How it works
 
 - Cooks every frame.

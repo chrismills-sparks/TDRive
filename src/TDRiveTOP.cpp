@@ -218,6 +218,7 @@ TDRiveTOP::TDRiveTOP(const OP_NodeInfo* /*info*/, TOP_Context* context)
 TDRiveTOP::~TDRiveTOP()
 {
     releaseFile();
+    mTrackingFactory.reset();
     mBackend.reset();
 }
 
@@ -340,6 +341,36 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
         np.defaultValues[3] = 0.0; np.minSliders[3] = 0.0; np.maxSliders[3] = 1.0;
         m->appendRGBA(np);
     }
+
+    // Mask output: a second render of the same frame into color buffer 1
+    // (fetch it with a Render Select TOP): greyscale, every object at its
+    // world opacity, combined with max. See rive_mask.h.
+    {
+        OP_NumericParameter np("Maskoutput");
+        np.label = "Mask Output";
+        np.page  = "Mask";
+        np.defaultValues[0] = 0.0;
+        m->appendToggle(np);
+    }
+    {
+        OP_NumericParameter np("Maskresolution");
+        np.label = "Mask Resolution";
+        np.page  = "Mask";
+        np.defaultValues[0] = 0.5;
+        np.minValues[0] = 0.0625; np.maxValues[0] = 1.0;
+        np.clampMins[0] = true;   np.clampMaxes[0] = true;
+        np.minSliders[0] = 0.0625; np.maxSliders[0] = 1.0;
+        m->appendFloat(np);
+    }
+    {
+        OP_StringParameter sp("Maskmode");
+        sp.label = "Mask Mode";
+        sp.page  = "Mask";
+        sp.defaultValue = "presence";
+        const char* names[]  = {"presence", "alpha"};
+        const char* labels[] = {"Presence x Opacity", "Paint Alpha x Opacity"};
+        m->appendMenu(sp, 2, names, labels);
+    }
 }
 
 void TDRiveTOP::pulsePressed(const char* name, void*)
@@ -458,6 +489,8 @@ constexpr const char* kInfoChanNames[] = {
     // A node that cooks but shows nothing is otherwise indistinguishable from
     // one that loaded a blank artboard.
     "file_loaded", "artboard_loaded", "scene_loaded",
+    // The Mask output's whole pass (render + copy out), 0 when it is off.
+    "mask_ms",
 };
 constexpr int32_t kNumInfoChans =
     (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
@@ -479,6 +512,7 @@ void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
         t.unmapMs, mCudaBeginMs, mCudaInjectMs, mCudaEndMs,
         t.renderGpuMs, (double)mOutW, (double)mOutH,
         mFile ? 1.0 : 0.0, mArtboard ? 1.0 : 0.0, mScene ? 1.0 : 0.0,
+        t.maskMs,
     };
     // These two lists are indexed by the same 'index'; keep them in step.
     static_assert((int32_t)(sizeof(values) / sizeof(values[0])) == kNumInfoChans,
@@ -670,6 +704,8 @@ void TDRiveTOP::releaseArtboard()
 {
     mVMRuntime.reset();
     mVmProps.clear();
+    // The next artboard's paints need stamping from scratch.
+    mOwnersTaggedAt = ~0ull;
     // RenderImages bound into the outgoing view model; bindArtboardViewModel()
     // clears these for the same reason.
     for (auto& p : mBoundSlotImage) p = nullptr;
@@ -689,7 +725,16 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
         if (mFile) releaseFile();
         return false;
     }
-    if (path == mLoadedPath && mFile) return true;
+    // A file imported for the other mask mode has paints of the wrong kind
+    // (see rive_mask.h), so toggling Mask Output reloads it.
+    if (path == mLoadedPath && mFile && mLoadedTracked == mWantTracked) return true;
+
+    rive::Factory* factory = mBackend->factory();
+    if (mWantTracked) {
+        if (!mTrackingFactory)
+            mTrackingFactory = std::make_unique<tdrive::TrackingFactory>(factory);
+        factory = mTrackingFactory.get();
+    }
 
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) {
@@ -703,7 +748,7 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
     rive::ImportResult ir;
     auto file = rive::File::import(
         rive::Span<const uint8_t>(bytes.data(), bytes.size()),
-        mBackend->factory(), &ir);
+        factory, &ir);
     if (!file || ir != rive::ImportResult::success) {
         setError("Failed to parse .riv: " + path);
         releaseFile();
@@ -714,6 +759,7 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
     releaseFile();
     mFile = std::move(file);
     mLoadedPath = path;
+    mLoadedTracked = mWantTracked;
     clearError();
     return true;
 }
@@ -1283,6 +1329,13 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     double speed = inputs->getParDouble("Speed");
     double bg[4] = {0,0,0,0};
     inputs->getParDouble4("Bgcolor", bg[0], bg[1], bg[2], bg[3]);
+    const bool   maskOn   = inputs->getParInt("Maskoutput") != 0;
+    const double maskRes  = inputs->getParDouble("Maskresolution");
+    const auto   maskMode = inputs->getParInt("Maskmode") == 1
+                                ? tdrive::MaskMode::Alpha
+                                : tdrive::MaskMode::Presence;
+    mWantTracked = maskOn;
+    if (!maskOn) mBackend->releaseMaskTarget();
 
     bool ok = loadFileIfNeeded(filePath.c_str());
     // An empty resolved path is otherwise completely silent - no error, no
@@ -1389,9 +1442,20 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     fd.clearColor = ((uint32_t)a8 << 24) | ((uint32_t)r8 << 16)
                   | ((uint32_t)g8 <<  8) |  (uint32_t)b8;
 
-    auto makeDrawFn = [this, fitIdx, alignIdx](int32_t w, int32_t h) {
-        return [this, fitIdx, alignIdx, w, h](rive::Renderer* r) {
+    // (w, h) is the main output's size; (tw, th) the target actually drawn
+    // into. They differ only for the mask pass, which draws the SAME framing
+    // scaled down - so every Fit, Layout included, lines up with the main
+    // output pixel for pixel rather than being re-fitted into a smaller box.
+    auto makeDrawFn = [this, fitIdx, alignIdx, maskMode](int32_t w, int32_t h,
+                                                         int32_t tw, int32_t th,
+                                                         bool mask) {
+        return [this, fitIdx, alignIdx, maskMode, w, h, tw, th, mask](rive::Renderer* rr) {
             if (!mArtboard) return;
+            // A file imported for the mask holds TrackedPaints, which Rive's
+            // renderer would silently skip; every draw of it goes through a
+            // PassRenderer. See rive_mask.h.
+            tdrive::PassRenderer pass(rr, mask, maskMode, mBackend->factory());
+            rive::Renderer* r = mLoadedTracked ? &pass : rr;
             const rive::Fit fit = FitFromIndex(fitIdx);
             r->save();
             if (gCUDAMode) {
@@ -1402,8 +1466,10 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
                 // upside down. Flip the scene about the middle of the render
                 // target instead - it is free, where flipping the texture
                 // afterwards is another full-surface copy.
-                r->transform(rive::Mat2D(1.0f, 0.0f, 0.0f, -1.0f, 0.0f, (float)h));
+                r->transform(rive::Mat2D(1.0f, 0.0f, 0.0f, -1.0f, 0.0f, (float)th));
             }
+            if (tw != w || th != h)
+                r->scale((float)tw / (float)w, (float)th / (float)h);
             r->align(fit,
                      AlignmentFromIndex(alignIdx),
                      rive::AABB(0, 0, (float)w, (float)h),
@@ -1412,6 +1478,30 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
             r->restore();
         };
     };
+
+    // The mask pass's frame: same as the main one but always cleared to
+    // opaque black, whatever the Background Color - the mask is greyscale,
+    // drawn with lighten (max) on top of it. See TrackedPaint::maskPaint().
+    auto maskFrame = [&fd](int32_t w, int32_t h) {
+        rive::gpu::RenderContext::FrameDescriptor m = fd;
+        m.renderTargetWidth  = (uint32_t)w;
+        m.renderTargetHeight = (uint32_t)h;
+        m.clearColor = 0xFF000000;
+        return m;
+    };
+    int32_t maskW = 0, maskH = 0;
+    auto computeMaskSize = [&](int32_t w, int32_t h) {
+        maskW = std::clamp((int32_t)std::lround(w * maskRes), 1, w);
+        maskH = std::clamp((int32_t)std::lround(h * maskRes), 1, h);
+    };
+    // Stamp owners onto any paint made since the last walk - after the
+    // advance above, which is when data-bound lists add artboards.
+    const bool doMask = ok && maskOn && mLoadedTracked && mArtboard;
+    if (doMask && mTrackingFactory &&
+        mTrackingFactory->paintsMade() != mOwnersTaggedAt) {
+        tdrive::tagPaintOwners(mArtboard.get());
+        mOwnersTaggedAt = mTrackingFactory->paintsMade();
+    }
 
 #if defined(_WIN32)
     if (gCUDAMode) {
@@ -1471,6 +1561,19 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         co.colorBufferIndex        = 0;
         const OP_CUDAArrayInfo* out = output->createCUDAArray(co, nullptr);
         if (!out) { setError("createCUDAArray failed."); return; }
+
+        // The mask goes out as color buffer 1. Like every array, it has to be
+        // created before beginCUDAOperations().
+        const OP_CUDAArrayInfo* maskOut = nullptr;
+        if (doMask) {
+            computeMaskSize(resW, resH);
+            TOP_CUDAOutputInfo mo = co;
+            mo.textureDesc.width  = (uint32_t)maskW;
+            mo.textureDesc.height = (uint32_t)maskH;
+            mo.colorBufferIndex   = 1;
+            maskOut = output->createCUDAArray(mo, nullptr);
+            if (!maskOut) addWarning("Mask output: createCUDAArray failed.");
+        }
 
         using Clock = std::chrono::steady_clock;
         auto msSince = [](Clock::time_point a) {
@@ -1538,8 +1641,30 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mCudaInjectMs = msSince(ti);
 
         std::string rerr;
-        bool rendered = mBackend->renderToCUDA(fd, makeDrawFn(resW, resH),
-                                               out->cudaArray, rerr);
+        bool rendered = mBackend->renderToCUDA(
+            fd, makeDrawFn(resW, resH, resW, resH, false), out->cudaArray, rerr);
+
+        if (rendered && maskOut && maskOut->cudaArray) {
+            // Render at the size TD actually allocated, as for the main frame.
+            if (const auto* api = tdrive::cuda::Get()) {
+                tdrive::cuda::ChannelFormatDesc fmt{};
+                tdrive::cuda::Extent ext{};
+                unsigned int flags = 0;
+                if (api->arrayGetInfo(&fmt, &ext, &flags, maskOut->cudaArray) ==
+                        tdrive::cuda::kSuccess && ext.width && ext.height) {
+                    maskW = (int32_t)ext.width;
+                    maskH = (int32_t)ext.height;
+                }
+            }
+            std::string merr;
+            if (!mBackend->ensureMaskTarget((uint32_t)maskW, (uint32_t)maskH, merr) ||
+                !mBackend->renderMaskToCUDA(
+                    maskFrame(maskW, maskH),
+                    makeDrawFn(resW, resH, maskW, maskH, true),
+                    maskOut->cudaArray, merr)) {
+                addWarning("Mask output: " + merr);
+            }
+        }
         // First cook only: creates the stream the next cook declares and uses.
         mBackend->ensureCudaStream();
         auto te = Clock::now();
@@ -1558,7 +1683,8 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mContext->createOutputBuffer(byteSize, TD::TOP_BufferFlags::None, nullptr);
 
     std::string err;
-    if (!mBackend->renderAndReadback(fd, makeDrawFn(resW, resH), buf->data, err)) {
+    if (!mBackend->renderAndReadback(fd, makeDrawFn(resW, resH, resW, resH, false),
+                                     buf->data, err)) {
         if (!err.empty()) setError(err);
         return;
     }
@@ -1574,6 +1700,29 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     up.firstPixel              = TD::TOP_FirstPixel::TopLeft;
     up.colorBufferIndex        = 0;
     output->uploadBuffer(&buf, up, nullptr);
+
+    // Mask output -> color buffer 1 (fetch with a Render Select TOP).
+    if (doMask) {
+        computeMaskSize(resW, resH);
+        std::string merr;
+        if (!mBackend->ensureMaskTarget((uint32_t)maskW, (uint32_t)maskH, merr)) {
+            addWarning("Mask output: " + merr);
+            return;
+        }
+        TD::OP_SmartRef<TD::TOP_Buffer> mbuf = mContext->createOutputBuffer(
+            (uint64_t)maskW * (uint64_t)maskH * 4, TD::TOP_BufferFlags::None, nullptr);
+        if (!mBackend->renderMaskAndReadback(
+                maskFrame(maskW, maskH),
+                makeDrawFn(resW, resH, maskW, maskH, true), mbuf->data, merr)) {
+            addWarning("Mask output: " + merr);
+            return;
+        }
+        TD::TOP_UploadInfo mu = up;
+        mu.textureDesc.width  = (uint32_t)maskW;
+        mu.textureDesc.height = (uint32_t)maskH;
+        mu.colorBufferIndex   = 1;
+        output->uploadBuffer(&mbuf, mu, nullptr);
+    }
 }
 
 // =============================================================================
