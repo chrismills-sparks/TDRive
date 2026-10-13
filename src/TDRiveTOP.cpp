@@ -173,11 +173,7 @@ TDRiveTOP::TDRiveTOP(const OP_NodeInfo* /*info*/, TOP_Context* context)
 
 TDRiveTOP::~TDRiveTOP()
 {
-    mVMRuntime.reset();
-    mSMI = nullptr;
-    mScene.reset();
-    mArtboard.reset();
-    mFile.reset();
+    releaseFile();
     mBackend.reset();
 }
 
@@ -305,16 +301,7 @@ void TDRiveTOP::setupParameters(OP_ParameterManager* m, void*)
 void TDRiveTOP::pulsePressed(const char* name, void*)
 {
     if (name && std::string(name) == "Reload") {
-        mLoadedPath.clear();
-        mLoadedArtboard.clear();
-        mLoadedStateMachine.clear();
-        mVMRuntime.reset();
-        mSMI = nullptr;
-        mScene.reset();
-        mArtboard.reset();
-        mFile.reset();
-        mPrevChopValues.clear();
-        mPrevDatValues.clear();
+        releaseFile();
     }
 }
 
@@ -423,6 +410,10 @@ constexpr const char* kInfoChanNames[] = {
     "cuda_mode",
     "unmap_ms", "cuda_begin_ms", "cuda_inject_ms", "cuda_end_ms",
     "render_gpu_ms", "out_w", "out_h",
+    // Load state: 1 once the file / artboard / scene resolved on this node.
+    // A node that cooks but shows nothing is otherwise indistinguishable from
+    // one that loaded a blank artboard.
+    "file_loaded", "artboard_loaded", "scene_loaded",
 };
 constexpr int32_t kNumInfoChans =
     (int32_t)(sizeof(kInfoChanNames) / sizeof(kInfoChanNames[0]));
@@ -443,6 +434,7 @@ void TDRiveTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void*)
         gCUDAMode ? 1.0 : 0.0,
         t.unmapMs, mCudaBeginMs, mCudaInjectMs, mCudaEndMs,
         t.renderGpuMs, (double)mOutW, (double)mOutH,
+        mFile ? 1.0 : 0.0, mArtboard ? 1.0 : 0.0, mScene ? 1.0 : 0.0,
     };
     // These two lists are indexed by the same 'index'; keep them in step.
     static_assert((int32_t)(sizeof(values) / sizeof(values[0])) == kNumInfoChans,
@@ -608,16 +600,40 @@ void TDRiveTOP::getInfoDATEntries(int32_t row, int32_t /*nEntries*/,
 // File / artboard / scene loading
 // =============================================================================
 
+// Everything below mFile points into it: the view-model runtime and the scene
+// bind view-model instances created from the file, the state machine instance
+// walks the artboard's components, and the artboard instance references the
+// file's objects and assets. So they go first and the file goes last - the
+// order pulsePressed("Reload") always used, which is why Reload survived.
+//
+// loadFileIfNeeded() used to do the opposite: `mFile = std::move(file)`
+// destroyed the OUTGOING file and only then reset the artboard and scene built
+// from it, so their destructors ran against freed memory. That is the same
+// class of bug as the artboard switch documented in selectArtboardIfNeeded(),
+// one level up - and the hang/crash on changing the File parameter.
+void TDRiveTOP::releaseFile()
+{
+    mVMRuntime.reset();
+    mVmProps.clear();
+    // RenderImages bound into the outgoing view model; bindArtboardViewModel()
+    // clears these for the same reason.
+    for (auto& p : mBoundSlotImage) p = nullptr;
+    mSMI = nullptr;
+    mScene.reset();
+    mArtboard.reset();
+    mFile.reset();
+    mLoadedPath.clear();
+    mLoadedArtboard.clear();
+    mLoadedStateMachine.clear();
+    mPrevChopValues.clear();
+    mPrevDatValues.clear();
+}
+
 bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
 {
     std::string path = absPath ? absPath : "";
     if (path.empty()) {
-        if (mFile) {
-            mFile.reset(); mArtboard.reset(); mScene.reset();
-            mSMI = nullptr; mVMRuntime.reset();
-            mLoadedPath.clear(); mLoadedArtboard.clear(); mLoadedStateMachine.clear();
-            mPrevChopValues.clear(); mPrevDatValues.clear();
-        }
+        if (mFile) releaseFile();
         return false;
     }
     if (path == mLoadedPath && mFile) return true;
@@ -625,9 +641,7 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) {
         setError("Could not open .riv file: " + path);
-        mFile.reset(); mArtboard.reset(); mScene.reset();
-        mSMI = nullptr; mVMRuntime.reset();
-        mLoadedPath.clear();
+        releaseFile();
         return false;
     }
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
@@ -639,17 +653,14 @@ bool TDRiveTOP::loadFileIfNeeded(const char* absPath)
         mBackend->factory(), &ir);
     if (!file || ir != rive::ImportResult::success) {
         setError("Failed to parse .riv: " + path);
-        mFile.reset(); mArtboard.reset(); mScene.reset();
-        mSMI = nullptr; mVMRuntime.reset();
-        mLoadedPath.clear();
+        releaseFile();
         return false;
     }
+    // Tear down the outgoing file's dependents while it is still alive, THEN
+    // adopt the new one. See releaseFile().
+    releaseFile();
     mFile = std::move(file);
-    mArtboard.reset(); mScene.reset();
-    mSMI = nullptr; mVMRuntime.reset();
-    mPrevChopValues.clear(); mPrevDatValues.clear();
     mLoadedPath = path;
-    mLoadedArtboard.clear(); mLoadedStateMachine.clear();
     clearError();
     return true;
 }
@@ -1186,7 +1197,13 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
         mBackendReady = true;
     }
 
-    const char* filePath = inputs->getParFilePath("File");
+    // A string from getParFilePath()/getParString() is only guaranteed until
+    // the same parameter is read again (CPlusPlus_Common.hpp), and both read
+    // "File" - so each is copied before the next read.
+    const char* filePathC = inputs->getParFilePath("File");
+    const std::string filePath = filePathC ? filePathC : "";
+    const char* fileRawC = inputs->getParString("File");
+    const std::string fileRaw = fileRawC ? fileRawC : "";
     const char* artboard = inputs->getParString("Artboard");
     const char* stateMch = inputs->getParString("Statemachine");
     int fitIdx   = inputs->getParInt("Fit");
@@ -1195,7 +1212,30 @@ void TDRiveTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void*)
     double bg[4] = {0,0,0,0};
     inputs->getParDouble4("Bgcolor", bg[0], bg[1], bg[2], bg[3]);
 
-    bool ok = loadFileIfNeeded(filePath);
+    bool ok = loadFileIfNeeded(filePath.c_str());
+    // An empty resolved path is otherwise completely silent - no error, no
+    // file, and a blank default-sized frame. When the parameter itself is set,
+    // that is a failure worth reporting.
+    //
+    // TouchDesigner resolves a path that does not exist to "". It also does
+    // so for a CLONE whose clone master had Allow Cooking turned off and back
+    // on: from then on the clone reads every custom number as 0 and every
+    // file path as "", while Python still shows the right values (TD
+    // 2025.33230; only re-cloning or a restart recovers it). A raw path that
+    // opens from here tells the two cases apart.
+    // No file set at all is not an error; drop one left from an earlier file.
+    if (!ok && fileRaw.empty()) clearError();
+    if (!ok && filePath.empty() && !fileRaw.empty()) {
+        if (std::ifstream(fileRaw, std::ios::binary).good()) {
+            setError("File '" + fileRaw + "' exists, but TouchDesigner "
+                     "returns this node's parameters as empty. On a clone this "
+                     "follows turning the clone master's Allow Cooking off and "
+                     "on - turn Enable Cloning off and on for this clone, or "
+                     "restart TouchDesigner.");
+        } else {
+            setError("File parameter '" + fileRaw + "' resolved to an empty path.");
+        }
+    }
     if (ok) ok = selectArtboardIfNeeded(artboard);
     if (ok) ok = selectSceneIfNeeded(stateMch);
 

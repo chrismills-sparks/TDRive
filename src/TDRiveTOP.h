@@ -69,6 +69,8 @@ public:
 
 private:
     bool loadFileIfNeeded(const char* absPath);
+    // Destroys the loaded file and everything built from it, dependents first.
+    void releaseFile();
     bool selectArtboardIfNeeded(const char* name);
     bool selectSceneIfNeeded(const char* stateMachineName);
     void applyInputsFromCHOP(const TD::OP_CHOPInput* chop);
