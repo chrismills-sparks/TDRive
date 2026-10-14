@@ -1085,7 +1085,7 @@ void TDRiveTOP::applyStringsFromDAT(const OP_DATInput* dat)
                 else if (!value.empty())
                     addWarning("Colour '" + name + "' needs #AARRGGBB or "
                                "#RRGGBB, got '" + value + "'.");
-                if (next != cur) cp->value((int)next);
+                if (next != cur) { cp->value((int)next); mInputsChanged = true; }
                 handled = true;
             } else if (auto* ap = mVMRuntime->propertyArtboard(name)) {
                 // An artboard property takes the NAME of an artboard in this
